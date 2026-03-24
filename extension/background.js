@@ -517,9 +517,9 @@ async function maybeSendEntry(key) {
   }
   delete entry._rawChunks;
 
-  // If filter failed and we still have no body, try fetching from cache as fallback
+  // If we still have no body, try fetching from cache as fallback
   // Only refetch for safe methods to avoid unintended side effects
-  if (entry._filterFailed && !entry.response_body && entry.url) {
+  if (!entry.response_body && entry.url) {
     const skipType = SKIP_CONTENT_TYPES.test(entry.content_type || "");
     const safeMethod = entry.method === "GET" || entry.method === "HEAD";
     if (!skipType && safeMethod) {
@@ -672,6 +672,10 @@ browser.webRequest.onBeforeRequest.addListener(
           // Store raw chunks — decoding happens in maybeSendEntry once headers are available
           pending._rawChunks = chunks;
           pending._filterDone = true;
+          // Filter completed but captured no data — treat as failure so fallback can try
+          if (chunks.length === 0) {
+            pending._filterFailed = true;
+          }
           maybeSendEntry(key);
         }
       };
@@ -748,6 +752,7 @@ browser.webRequest.onCompleted.addListener(
         const pending = pendingRequests.get(key);
         if (pending && !pending._filterDone) {
           pending._filterDone = true;
+          pending._filterFailed = true;
           maybeSendEntry(key);
         }
       }, FILTER_FALLBACK_TIMEOUT_MS);
