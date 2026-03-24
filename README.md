@@ -265,6 +265,9 @@ Content script injection is blocked on privileged pages (`about:*`, `moz-extensi
 **Console logs are empty on first call**
 Console log capture requires a content script injection, which happens on the first `get_console_logs` call. Logs generated before that first call are not captured. Call the tool once, reproduce the console output, then call it again.
 
+**POST response bodies are missing on pages with strict CSP**
+The XHR/fetch hook fallback injects an inline `<script>` tag into the page. Pages with a strict `Content-Security-Policy` that blocks inline scripts (`script-src` without `'unsafe-inline'`) will prevent the hook from running. In that case, POST response bodies may be missing if Firefox's `filterResponseData` also fails (common with servers that send `connection: close` + gzip). GET responses are unaffected as they use a separate cache-based fallback.
+
 ## Security Notes
 
 - The WebSocket server binds to `127.0.0.1` only -- not accessible from the network.

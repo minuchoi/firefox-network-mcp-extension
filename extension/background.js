@@ -724,7 +724,7 @@ function sendEntry(entry) {
   delete entry._completeDone;
   delete entry._fallbackTimer;
   delete entry._hardTimer;
-  delete entry._filterFailed;
+
   delete entry._xhrBody;
   send({
     type: "network_event",
@@ -781,7 +781,7 @@ browser.webRequest.onBeforeRequest.addListener(
       response_body_truncated: false,
       _filterDone: false,
       _completeDone: false,
-      _filterFailed: false,
+
       _fallbackTimer: null,
       _hardTimer: null,
     };
@@ -845,10 +845,6 @@ browser.webRequest.onBeforeRequest.addListener(
           // Store raw chunks — decoding happens in maybeSendEntry once headers are available
           pending._rawChunks = chunks;
           pending._filterDone = true;
-          // Filter completed but captured no data — treat as failure so fallback can try
-          if (chunks.length === 0) {
-            pending._filterFailed = true;
-          }
           maybeSendEntry(key);
         }
       };
@@ -859,7 +855,6 @@ browser.webRequest.onBeforeRequest.addListener(
         const pending = pendingRequests.get(key);
         if (pending) {
           pending._filterDone = true;
-          pending._filterFailed = true;
           maybeSendEntry(key);
         }
       };
@@ -867,7 +862,6 @@ browser.webRequest.onBeforeRequest.addListener(
       // filterResponseData not available (cached, service worker, etc.)
       console.debug("[BrowserBridge] filterResponseData unavailable for", details.url, err.message);
       entry._filterDone = true;
-      entry._filterFailed = true;
     }
   },
   { urls: ["<all_urls>"] },
@@ -925,7 +919,6 @@ browser.webRequest.onCompleted.addListener(
         const pending = pendingRequests.get(key);
         if (pending && !pending._filterDone) {
           pending._filterDone = true;
-          pending._filterFailed = true;
           maybeSendEntry(key);
         }
       }, FILTER_FALLBACK_TIMEOUT_MS);
@@ -1119,7 +1112,9 @@ async function handleStopWsCapture(msg) {
 // AND messages from the popup UI
 browser.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg.type === "xhr_body_relay") {
-    correlateXhrBody(msg, sender.tab ? sender.tab.id : -1);
+    if (capabilities.network) {
+      correlateXhrBody(msg, sender.tab ? sender.tab.id : -1);
+    }
     return;
   }
 
