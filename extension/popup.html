@@ -1,0 +1,351 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <style>
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+    }
+
+    body {
+      width: 300px;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      background: #1e1e2e;
+      color: #cdd6f4;
+      font-size: 13px;
+    }
+
+    .header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 14px 16px;
+      border-bottom: 1px solid #313244;
+    }
+
+    .header h1 {
+      font-size: 14px;
+      font-weight: 600;
+      color: #cdd6f4;
+    }
+
+    .status {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 12px;
+      color: #a6adc8;
+    }
+
+    .status-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: #f38ba8;
+      flex-shrink: 0;
+    }
+
+    .status-dot.connected {
+      background: #a6e3a1;
+    }
+
+    .connection-info {
+      padding: 4px 16px 8px;
+      font-size: 11px;
+      color: #585b70;
+      font-family: monospace;
+    }
+
+    .capabilities {
+      padding: 8px 0;
+    }
+
+    .capability-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 10px 16px;
+      transition: background 0.15s;
+    }
+
+    .capability-row:hover {
+      background: #262637;
+    }
+
+    .capability-info {
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+    }
+
+    .capability-name {
+      font-size: 13px;
+      font-weight: 500;
+      color: #cdd6f4;
+    }
+
+    .capability-desc {
+      font-size: 11px;
+      color: #6c7086;
+    }
+
+    /* Toggle switch */
+    .toggle {
+      position: relative;
+      width: 36px;
+      height: 20px;
+      flex-shrink: 0;
+    }
+
+    .toggle input {
+      opacity: 0;
+      width: 0;
+      height: 0;
+    }
+
+    .toggle-track {
+      position: absolute;
+      inset: 0;
+      background: #45475a;
+      border-radius: 10px;
+      cursor: pointer;
+      transition: background 0.2s;
+    }
+
+    .toggle-track::after {
+      content: "";
+      position: absolute;
+      top: 2px;
+      left: 2px;
+      width: 16px;
+      height: 16px;
+      background: #cdd6f4;
+      border-radius: 50%;
+      transition: transform 0.2s;
+    }
+
+    .toggle input:checked + .toggle-track {
+      background: #a6e3a1;
+    }
+
+    .toggle input:checked + .toggle-track::after {
+      transform: translateX(16px);
+      background: #1e1e2e;
+    }
+
+    .toggle input:focus-visible + .toggle-track {
+      outline: 2px solid #89b4fa;
+      outline-offset: 2px;
+    }
+
+    /* Tab selector */
+    .tab-selector {
+      padding: 10px 16px;
+      border-bottom: 1px solid #313244;
+    }
+
+    .tab-selector-label {
+      font-size: 11px;
+      font-weight: 500;
+      color: #a6adc8;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      margin-bottom: 6px;
+    }
+
+    .tab-selector select {
+      width: 100%;
+      padding: 6px 8px;
+      background: #313244;
+      color: #cdd6f4;
+      border: 1px solid #45475a;
+      border-radius: 6px;
+      font-size: 12px;
+      font-family: inherit;
+      cursor: pointer;
+      outline: none;
+    }
+
+    .tab-selector select:focus {
+      border-color: #89b4fa;
+    }
+
+    .tab-selector select option {
+      background: #313244;
+      color: #cdd6f4;
+    }
+
+    /* Disabled state when disconnected */
+    .tab-selector select:disabled {
+      opacity: 0.4;
+      cursor: not-allowed;
+    }
+
+    .capabilities.disabled {
+      opacity: 0.4;
+      pointer-events: none;
+    }
+
+    /* Stats bar */
+    .stats-bar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 8px 16px;
+      border-top: 1px solid #313244;
+      font-size: 11px;
+      color: #6c7086;
+    }
+
+    .stats-counts {
+      display: flex;
+      gap: 12px;
+    }
+
+    .stat-item {
+      display: flex;
+      align-items: center;
+      gap: 4px;
+    }
+
+    .stat-value {
+      color: #a6adc8;
+      font-weight: 500;
+    }
+
+    .ws-capture-indicator {
+      display: none;
+      align-items: center;
+      gap: 4px;
+      padding: 6px 16px;
+      font-size: 11px;
+      color: #f9e2af;
+      background: rgba(249, 226, 175, 0.08);
+    }
+
+    .ws-capture-indicator.active {
+      display: flex;
+    }
+
+    .ws-capture-dot {
+      width: 6px;
+      height: 6px;
+      border-radius: 50%;
+      background: #f9e2af;
+      animation: pulse 1.5s infinite;
+    }
+
+    @keyframes pulse {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.3; }
+    }
+
+    .clear-btn {
+      background: none;
+      border: 1px solid #45475a;
+      color: #a6adc8;
+      font-size: 11px;
+      padding: 3px 8px;
+      border-radius: 4px;
+      cursor: pointer;
+      transition: all 0.15s;
+    }
+
+    .clear-btn:hover {
+      border-color: #f38ba8;
+      color: #f38ba8;
+    }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <h1>Browser Bridge</h1>
+    <div class="status">
+      <div class="status-dot" id="status-dot"></div>
+      <span id="status-text">Disconnected</span>
+    </div>
+  </div>
+
+  <div class="connection-info" id="connection-info"></div>
+
+  <div class="ws-capture-indicator" id="ws-capture-indicator">
+    <span class="ws-capture-dot"></span>
+    <span id="ws-capture-text">WS capture active</span>
+  </div>
+
+  <div class="tab-selector">
+    <div class="tab-selector-label">Monitor Tab</div>
+    <select id="tab-select">
+      <option value="all">All Tabs</option>
+    </select>
+  </div>
+
+  <div class="capabilities" id="capabilities">
+    <div class="capability-row">
+      <div class="capability-info">
+        <span class="capability-name">Network Requests</span>
+        <span class="capability-desc">Captures HTTP traffic continuously</span>
+      </div>
+      <label class="toggle">
+        <input type="checkbox" data-capability="network" checked>
+        <span class="toggle-track"></span>
+      </label>
+    </div>
+
+    <div class="capability-row">
+      <div class="capability-info">
+        <span class="capability-name">DOM / HTML</span>
+        <span class="capability-desc">On-demand page queries</span>
+      </div>
+      <label class="toggle">
+        <input type="checkbox" data-capability="dom" checked>
+        <span class="toggle-track"></span>
+      </label>
+    </div>
+
+    <div class="capability-row">
+      <div class="capability-info">
+        <span class="capability-name">Console Logs</span>
+        <span class="capability-desc">Captures logs from toggle-on</span>
+      </div>
+      <label class="toggle">
+        <input type="checkbox" data-capability="console" checked>
+        <span class="toggle-track"></span>
+      </label>
+    </div>
+
+    <div class="capability-row">
+      <div class="capability-info">
+        <span class="capability-name">WebSocket Frames</span>
+        <span class="capability-desc">Captures new WS connections when started</span>
+      </div>
+      <label class="toggle">
+        <input type="checkbox" data-capability="websocket" checked>
+        <span class="toggle-track"></span>
+      </label>
+    </div>
+  </div>
+
+  <div class="stats-bar">
+    <div class="stats-counts">
+      <div class="stat-item">
+        <span>Net:</span>
+        <span class="stat-value" id="stat-requests">0</span>
+      </div>
+      <div class="stat-item">
+        <span>WS:</span>
+        <span class="stat-value" id="stat-ws">0</span>
+      </div>
+      <div class="stat-item">
+        <span>Console:</span>
+        <span class="stat-value" id="stat-console">0</span>
+      </div>
+    </div>
+    <button class="clear-btn" id="clear-btn">Clear</button>
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>
