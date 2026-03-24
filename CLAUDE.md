@@ -27,6 +27,7 @@ The MCP server is configured in `.mcp.json` to launch via `uv run`.
 1. **Firefox Extension** (`extension/`) — Manifest V2 background script that:
    - Connects as a WebSocket client to `ws://127.0.0.1:7865`
    - Captures HTTP traffic via `webRequest` API listeners
+   - Captures response bodies via `filterResponseData` (primary) and page-level XHR/fetch hooking (fallback for POST responses where `filterResponseData` fails)
    - Injects content scripts on-demand for DOM queries, console log capture, and WebSocket frame interception
    - Sends captured data and tool responses as JSON messages to the server
    - Popup UI (`popup.html` / `popup.js`) with toggles for network, DOM, console, and WebSocket capabilities
@@ -40,6 +41,11 @@ The MCP server is configured in `.mcp.json` to launch via `uv run`.
 
 **Request/response correlation:** UUID-based `msg_id` with asyncio Futures (5s timeout). Single extension connection enforced.
 
+**Response body capture** has three layers of fallback:
+1. `filterResponseData` stream filter (primary — works for most responses)
+2. `fetch(url, {cache: "force-cache"})` fallback (GET/HEAD only, when filter produces 0 chunks)
+3. Page-level XHR/fetch hooking via `<script>` tag injection into the page's main world (captures POST response bodies that `filterResponseData` misses due to a Firefox bug with `connection: close` + gzip responses). Note: `wrappedJSObject` prototype overrides do NOT work for this — Firefox's Xray wrappers prevent page-world code from seeing content-script prototype changes. The hook must run in the actual page context. Bodies are correlated with webRequest entries by URL + method + tab ID + timestamp proximity (5s tolerance). Three-stage correlation: pending entry match → buffer lookup → server-side patch of already-stored entries.
+
 **Storage:** In-memory ring buffers in `request_store.py` — 500 requests/tab (max 20 tabs), 500 frames/connection URL. No persistence.
 
 ## Key Files
@@ -48,7 +54,7 @@ The MCP server is configured in `.mcp.json` to launch via `uv run`.
 - `src/mcp_server/tools.py` — All MCP tool definitions and dispatch logic (match/case)
 - `src/mcp_server/ws_bridge.py` — WebSocket server, ConnectionManager, message routing
 - `src/mcp_server/request_store.py` — RequestStore and WsFrameStore ring buffers
-- `extension/background.js` — All extension logic (WS client, network capture, DOM tools, WS frame capture, capability toggles)
+- `extension/background.js` — All extension logic (WS client, network capture, XHR/fetch body hooking, DOM tools, WS frame capture, capability toggles)
 - `extension/popup.html` — Popup UI for toggling capabilities and viewing connection status
 - `extension/popup.js` — Popup script communicating with background.js via runtime messaging
 

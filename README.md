@@ -51,7 +51,7 @@ The system has two components:
 
 1. **Python MCP Server** (`src/mcp_server/`) -- runs two async tasks: an MCP stdio server that exposes tools to Claude Code, and a WebSocket server on port 7865 that communicates with the extension.
 
-2. **Firefox Extension** (`extension/`) -- a Manifest V2 background script that connects as a WebSocket client to the MCP server. It captures HTTP traffic passively via the `webRequest` API and performs DOM queries, console log capture, and WebSocket frame interception on demand by injecting content scripts.
+2. **Firefox Extension** (`extension/`) -- a Manifest V2 background script that connects as a WebSocket client to the MCP server. It captures HTTP traffic passively via the `webRequest` API, with page-level XHR/fetch hooking as a fallback for response bodies that `filterResponseData` fails to capture (common with POST responses on servers that use `connection: close`). It performs DOM queries, console log capture, and WebSocket frame interception on demand by injecting content scripts.
 
 **Data flow:** Claude calls an MCP tool, the server either queries its local in-memory stores (for network data) or sends a command to the extension via WebSocket (for DOM, console, and WS operations). The extension executes the command and responds. Request/response correlation uses UUID-based message IDs with a 5-second timeout.
 
@@ -229,7 +229,7 @@ The MCP server (`src/mcp_server/server.py`) launches two concurrent async tasks:
 The Firefox extension runs a persistent background script that:
 
 - Connects as a WebSocket client and auto-reconnects with exponential backoff on disconnection.
-- Passively captures all HTTP traffic using Firefox's `webRequest` API. Request and response data (including bodies via `filterResponseData`) are streamed to the server and stored in in-memory ring buffers -- 500 requests per tab, up to 20 tabs.
+- Passively captures all HTTP traffic using Firefox's `webRequest` API. Response bodies are captured via `filterResponseData` (primary) with two fallback mechanisms: cache-based re-fetch for GET requests, and page-level XHR/`fetch` hooking via `<script>` tag injection for POST responses where `filterResponseData` produces no data (a Firefox limitation with `connection: close` + gzip responses). Captured data is stored in in-memory ring buffers -- 500 requests per tab, up to 20 tabs.
 - On demand, injects content scripts into the active tab to perform DOM queries, console log interception, and WebSocket frame capture.
 - Correlates requests and responses using UUID-based message IDs with asyncio Futures (5-second timeout on the server side).
 
@@ -243,7 +243,7 @@ Only a single extension connection is allowed at a time.
 | `src/mcp_server/tools.py` | MCP tool definitions and dispatch logic |
 | `src/mcp_server/ws_bridge.py` | WebSocket server, connection manager, message routing |
 | `src/mcp_server/request_store.py` | In-memory ring buffer stores for requests and WS frames |
-| `extension/background.js` | All extension logic: WS client, network capture, DOM tools, WS frame capture |
+| `extension/background.js` | All extension logic: WS client, network capture, XHR/fetch body hooking, DOM tools, WS frame capture |
 
 ## Troubleshooting
 

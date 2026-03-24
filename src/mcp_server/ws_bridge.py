@@ -126,6 +126,10 @@ class ConnectionManager:
             self._handle_ws_frame(data)
             return
 
+        if msg_type == "xhr_body_patch":
+            self._handle_xhr_body_patch(data)
+            return
+
         # Check if it's a response to a pending request
         msg_id = data.get("msg_id")
         if msg_id:
@@ -210,6 +214,41 @@ class ConnectionManager:
             tab_id=tab_id,
         )
         self.ws_frame_store.add(frame)
+
+    def _handle_xhr_body_patch(self, data: dict[str, Any]) -> None:
+        """Patch a previously stored request with a response body from the XHR hook."""
+        url = data.get("url")
+        method = data.get("method", "").upper()
+        body = data.get("response_body")
+
+        if not url or not body:
+            return
+
+        try:
+            tab_id = int(data.get("tab_id", -1))
+        except (TypeError, ValueError):
+            return
+
+        try:
+            timestamp = float(data.get("timestamp", 0))
+        except (TypeError, ValueError):
+            timestamp = 0.0
+
+        tolerance_ms = 5000
+        candidates = self.request_store.filter(
+            method=method, tab_id=tab_id, limit=50
+        )
+        for req in candidates:
+            if req.url != url:
+                continue
+            if req.response_body:
+                continue
+            if abs(req.timestamp - timestamp) > tolerance_ms:
+                continue
+            req.response_body = body[:MAX_RESPONSE_BODY_SIZE]
+            req.response_body_truncated = len(body) > MAX_RESPONSE_BODY_SIZE
+            logger.debug("Patched response body via XHR hook: %s %s", method, url[:80])
+            return
 
 
 async def ws_handler(

@@ -26,6 +26,13 @@ const wsCapturingPatterns = new Set();
 // Console log injection tracking
 const consoleInjectedTabs = new Set();
 
+// XHR/fetch hook injection tracking
+const xhrHookInjectedTabs = new Set();
+// Buffer for XHR-captured bodies awaiting correlation with webRequest entries
+// Key: "tabId:method:url", Value: { response_body, timestamp }
+const xhrBodyBuffer = new Map();
+const XHR_BODY_BUFFER_MAX = 500;
+
 // Tab monitoring: null means all tabs
 let monitoredTabId = null;
 
@@ -393,6 +400,153 @@ async function handleGetConsoleLogs(msg) {
   }
 }
 
+// ─── XHR/Fetch Response Body Capture ────────────────────────────────────────
+
+// Page-world script injected via <script> tag to hook XHR/fetch prototypes.
+// Must run in the actual page context (not content script) to intercept page XHR calls.
+const XHR_PAGE_HOOK = `(function() {
+  if (window.__browserBridgeXhrCapture) return;
+  window.__browserBridgeXhrCapture = true;
+
+  var MAX_BODY = 1048576;
+  var XHR = XMLHttpRequest.prototype;
+  var origOpen = XHR.open;
+  var origSend = XHR.send;
+  var xhrMeta = new WeakMap();
+
+  XHR.open = function(method, url) {
+    xhrMeta.set(this, { method: method, url: typeof url === "string" ? url : String(url), timestamp: Date.now() });
+    return origOpen.apply(this, arguments);
+  };
+
+  XHR.send = function() {
+    var meta = xhrMeta.get(this);
+    if (meta) {
+      var xhr = this;
+      xhr.addEventListener("load", function() {
+        try {
+          var body = xhr.responseText;
+          if (body && body.length > 0) {
+            window.postMessage({
+              __browserBridgeXhrBody: true,
+              method: meta.method,
+              url: meta.url,
+              timestamp: meta.timestamp,
+              status: xhr.status,
+              response_body: body.length > MAX_BODY ? body.slice(0, MAX_BODY) : body,
+            }, "*");
+          }
+        } catch(e) {}
+      });
+    }
+    return origSend.apply(this, arguments);
+  };
+
+  var origFetch = window.fetch;
+  if (origFetch) {
+    window.fetch = function(input, init) {
+      var method = (init && init.method) || "GET";
+      var url = typeof input === "string" ? input : (input && input.url ? input.url : String(input));
+      var timestamp = Date.now();
+      return origFetch.apply(this, arguments).then(function(response) {
+        var cloned = response.clone();
+        cloned.text().then(function(text) {
+          if (text && text.length > 0) {
+            window.postMessage({
+              __browserBridgeXhrBody: true,
+              method: method.toUpperCase(),
+              url: url,
+              timestamp: timestamp,
+              status: cloned.status,
+              response_body: text.length > MAX_BODY ? text.slice(0, MAX_BODY) : text,
+            }, "*");
+          }
+        }).catch(function() {});
+        return response;
+      });
+    };
+  }
+})();`;
+
+// Content-script code: sets up the postMessage relay AND injects the page-world hook via <script> tag
+const XHR_HOOK_CODE = `
+  (function() {
+    // --- Relay: content script context, bridges postMessage -> runtime.sendMessage ---
+    if (!window.__browserBridgeXhrRelay) {
+      window.__browserBridgeXhrRelay = true;
+      window.addEventListener("message", function(event) {
+        if (event.source !== window) return;
+        if (!event.data || !event.data.__browserBridgeXhrBody) return;
+        browser.runtime.sendMessage({
+          type: "xhr_body_relay",
+          method: event.data.method,
+          url: event.data.url,
+          timestamp: event.data.timestamp,
+          status: event.data.status,
+          response_body: event.data.response_body,
+        });
+      });
+    }
+
+    // --- Inject page-world hook via <script> tag ---
+    if (!document.getElementById("__browserBridgeXhrHook")) {
+      var s = document.createElement("script");
+      s.id = "__browserBridgeXhrHook";
+      s.textContent = ${JSON.stringify(XHR_PAGE_HOOK)};
+      (document.documentElement || document).appendChild(s);
+      s.remove();
+    }
+  })();
+`;
+
+async function injectXhrHook(tabId) {
+  if (xhrHookInjectedTabs.has(tabId)) return;
+  try {
+    await browser.tabs.executeScript(tabId, { code: XHR_HOOK_CODE, runAt: "document_start" });
+    xhrHookInjectedTabs.add(tabId);
+  } catch {
+    // Tab may not be ready yet or is a privileged page — silently ignore
+  }
+}
+
+function correlateXhrBody(msg, tabId) {
+  const { method, url, timestamp, status, response_body } = msg;
+  if (!response_body || !url) return;
+
+  const TOLERANCE_MS = 5000;
+
+  // Strategy 1: Try to match a pending webRequest entry that has no body yet
+  for (const [key, entry] of pendingRequests) {
+    if (entry.tab_id !== tabId) continue;
+    if (entry.method !== method) continue;
+    if (entry.url !== url) continue;
+    if (Math.abs(entry.timestamp - timestamp) > TOLERANCE_MS) continue;
+    if (entry.response_body) continue;
+
+    entry._xhrBody = response_body;
+    return;
+  }
+
+  // Strategy 2: Buffer for later correlation, and also send patch to server
+  // for entries already dispatched
+  const bufferKey = tabId + ":" + method + ":" + url;
+  xhrBodyBuffer.set(bufferKey, { response_body, timestamp, received: Date.now() });
+  if (xhrBodyBuffer.size > XHR_BODY_BUFFER_MAX) {
+    const firstKey = xhrBodyBuffer.keys().next().value;
+    xhrBodyBuffer.delete(firstKey);
+  }
+
+  send({
+    type: "xhr_body_patch",
+    tab_id: tabId,
+    method: method,
+    url: url,
+    timestamp: timestamp,
+    status_code: status,
+    response_body: (response_body || "").slice(0, MAX_BODY_SIZE),
+  });
+}
+
 // ─── Response Body Decoding ──────────────────────────────────────────────────
 
 /**
@@ -527,6 +681,24 @@ async function maybeSendEntry(key) {
     }
   }
 
+  // If XHR hook captured a body for this entry, use it
+  if (!entry.response_body && entry._xhrBody) {
+    entry.response_body = entry._xhrBody.slice(0, MAX_BODY_SIZE);
+    entry.response_body_truncated = entry._xhrBody.length > MAX_BODY_SIZE;
+  }
+
+  // Check the XHR body buffer for a match (XHR load event may fire before webRequest completes)
+  if (!entry.response_body && entry.url) {
+    const bufferKey = entry.tab_id + ":" + entry.method + ":" + entry.url;
+    const buffered = xhrBodyBuffer.get(bufferKey);
+    if (buffered && Math.abs(entry.timestamp - buffered.timestamp) < 5000) {
+      entry.response_body = buffered.response_body.slice(0, MAX_BODY_SIZE);
+      entry.response_body_truncated = buffered.response_body.length > MAX_BODY_SIZE;
+      xhrBodyBuffer.delete(bufferKey);
+    }
+  }
+  delete entry._xhrBody;
+
   sendEntry(entry);
 }
 
@@ -553,6 +725,7 @@ function sendEntry(entry) {
   delete entry._fallbackTimer;
   delete entry._hardTimer;
   delete entry._filterFailed;
+  delete entry._xhrBody;
   send({
     type: "network_event",
     ...entry,
@@ -770,15 +943,21 @@ browser.webRequest.onErrorOccurred.addListener(
   { urls: ["<all_urls>"] }
 );
 
-// Re-inject console capture on navigation when capability is on, and clean up stale WS connections
+// Re-inject captures on navigation when capabilities are on, and clean up stale WS connections
 browser.tabs.onUpdated.addListener((tabId, changeInfo) => {
   if (changeInfo.status === "loading") {
     consoleInjectedTabs.delete(tabId);
+    xhrHookInjectedTabs.delete(tabId);
 
     // Re-inject console capture eagerly if the capability is enabled
     if (capabilities.console) {
       // Small delay to let the new document start loading
       setTimeout(() => injectConsoleCapture(tabId), 100);
+    }
+
+    // Re-inject XHR hook eagerly if network capability is enabled
+    if (capabilities.network) {
+      setTimeout(() => injectXhrHook(tabId), 100);
     }
 
     // Clean up tracked WS connections for this tab on navigation
@@ -794,6 +973,7 @@ browser.tabs.onUpdated.addListener((tabId, changeInfo) => {
 // Clean up tab-associated state on tab close
 browser.tabs.onRemoved.addListener((tabId) => {
   consoleInjectedTabs.delete(tabId);
+  xhrHookInjectedTabs.delete(tabId);
   if (monitoredTabId === tabId) {
     monitoredTabId = null;
   }
@@ -938,6 +1118,11 @@ async function handleStopWsCapture(msg) {
 // Listen for WS frame messages relayed from content scripts via runtime messaging
 // AND messages from the popup UI
 browser.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  if (msg.type === "xhr_body_relay") {
+    correlateXhrBody(msg, sender.tab ? sender.tab.id : -1);
+    return;
+  }
+
   if (msg.type === "ws_frame_relay") {
     send({
       type: "ws_frame",
@@ -972,6 +1157,8 @@ browser.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     trackedWsConnections.clear();
     wsCapturingPatterns.clear();
     consoleInjectedTabs.clear();
+    xhrHookInjectedTabs.clear();
+    xhrBodyBuffer.clear();
     sendResponse({ ok: true });
     return;
   }
@@ -986,6 +1173,13 @@ browser.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           const tab = await getTargetTab();
           if (tab) {
             await injectConsoleCapture(tab.id);
+          }
+        }
+        // Eagerly inject XHR hook into the active tab when network toggled on
+        if (name === "network" && enabled) {
+          const tab = await getTargetTab();
+          if (tab) {
+            await injectXhrHook(tab.id);
           }
         }
         sendResponse({ ok: true, capabilities: { ...capabilities } });
@@ -1028,6 +1222,18 @@ loadCapabilities().then(async () => {
       const tabs = await browser.tabs.query({ active: true, currentWindow: true });
       if (tabs.length > 0) {
         await injectConsoleCapture(tabs[0].id);
+      }
+    } catch {
+      // May fail on privileged pages — ignore
+    }
+  }
+
+  // Eagerly inject XHR hook into the active tab on startup
+  if (capabilities.network) {
+    try {
+      const tabs = await browser.tabs.query({ active: true, currentWindow: true });
+      if (tabs.length > 0) {
+        await injectXhrHook(tabs[0].id);
       }
     } catch {
       // May fail on privileged pages — ignore
