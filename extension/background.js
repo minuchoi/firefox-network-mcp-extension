@@ -448,24 +448,34 @@ const XHR_PAGE_HOOK = `(function() {
       var method = (init && init.method) || "GET";
       var url = typeof input === "string" ? input : (input && input.url ? input.url : String(input));
       var timestamp = Date.now();
+      var upperMethod = method.toUpperCase();
+      var isMutating = upperMethod !== "GET" && upperMethod !== "HEAD";
       return origFetch.apply(this, arguments).then(function(response) {
         var cloned = response.clone();
-        // Inline the body read into the promise chain so the caller's
-        // await/then cannot resolve (and navigate away) before we capture
-        // the body and post it to the content-script relay.
-        return cloned.text().then(function(text) {
+        function postBody(text) {
           if (text && text.length > 0) {
             window.postMessage({
               __browserBridgeXhrBody: true,
-              method: method.toUpperCase(),
+              method: upperMethod,
               url: url,
               timestamp: timestamp,
               status: cloned.status,
               response_body: text.length > MAX_BODY ? text.slice(0, MAX_BODY) : text,
             }, "*");
           }
-          return response;
-        }).catch(function() { return response; });
+        }
+        if (isMutating) {
+          // Inline the body read for POST/PUT/DELETE/PATCH so the caller's
+          // await/then cannot resolve (and navigate away) before we capture.
+          return cloned.text().then(function(text) {
+            postBody(text);
+            return response;
+          }).catch(function() { return response; });
+        }
+        // GET/HEAD: detached read — filterResponseData or cache fallback handles these,
+        // so don't add latency to the caller's promise chain.
+        cloned.text().then(function(text) { postBody(text); }).catch(function() {});
+        return response;
       });
     };
   }
@@ -945,17 +955,22 @@ browser.tabs.onUpdated.addListener((tabId, changeInfo) => {
     consoleInjectedTabs.delete(tabId);
     xhrHookInjectedTabs.delete(tabId);
 
-    // Re-inject console capture eagerly if the capability is enabled
-    if (capabilities.console) {
-      // Small delay to let the new document start loading
-      setTimeout(() => injectConsoleCapture(tabId), 100);
-    }
+    // Only inject into monitored tabs to avoid unnecessary IPC across all tabs
+    if (!isTabMonitored(tabId)) {
+      // Still clean up WS connections for unmonitored tabs (below)
+    } else {
+      // Re-inject console capture eagerly if the capability is enabled
+      if (capabilities.console) {
+        // Small delay to let the new document start loading
+        setTimeout(() => injectConsoleCapture(tabId), 100);
+      }
 
-    // Re-inject XHR hook eagerly if network capability is enabled
-    // No delay — executeScript with runAt:"document_start" handles timing,
-    // and delaying risks the page's scripts capturing window.fetch first.
-    if (capabilities.network) {
-      injectXhrHook(tabId);
+      // Re-inject XHR hook eagerly if network capability is enabled
+      // No delay — executeScript with runAt:"document_start" handles timing,
+      // and delaying risks the page's scripts capturing window.fetch first.
+      if (capabilities.network) {
+        injectXhrHook(tabId);
+      }
     }
 
     // Clean up tracked WS connections for this tab on navigation
