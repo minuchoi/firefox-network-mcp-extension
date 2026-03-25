@@ -425,7 +425,20 @@ const XHR_PAGE_HOOK = `(function() {
       var xhr = this;
       xhr.addEventListener("load", function() {
         try {
-          var body = xhr.responseText;
+          // Extract body based on responseType — responseText throws for
+          // non-"" / non-"text" types (arraybuffer, blob, document, json)
+          var body;
+          var rt = xhr.responseType;
+          if (!rt || rt === "" || rt === "text") {
+            body = xhr.responseText;
+          } else if (rt === "json") {
+            body = xhr.response != null ? JSON.stringify(xhr.response) : null;
+          } else if (rt === "document") {
+            body = xhr.response ? new XMLSerializer().serializeToString(xhr.response) : null;
+          } else {
+            // arraybuffer, blob — skip, not text-representable
+            body = null;
+          }
           if (body && body.length > 0) {
             window.postMessage({
               __browserBridgeXhrBody: true,

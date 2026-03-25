@@ -268,6 +268,9 @@ Console log capture requires a content script injection, which happens on the fi
 **POST response bodies are missing on pages with strict CSP**
 The XHR/fetch hook fallback injects an inline `<script>` tag into the page. Pages with a strict `Content-Security-Policy` that blocks inline scripts (`script-src` without `'unsafe-inline'`) will prevent the hook from running. In that case, POST response bodies may be missing if Firefox's `filterResponseData` also fails (common with servers that send `connection: close` + gzip). GET responses are unaffected as they use a separate cache-based fallback.
 
+**Response bodies show garbled text**
+This can happen if the response uses brotli (`br`) content-encoding and Firefox's `filterResponseData` delivers raw compressed bytes instead of decompressed data. This is rare in practice. The XHR/fetch hook handles JSON, XML (`responseType: "document"`), and plain text responses correctly; binary formats (arraybuffer, blob) are skipped.
+
 ## Security Notes
 
 - The WebSocket server binds to `127.0.0.1` only -- not accessible from the network.

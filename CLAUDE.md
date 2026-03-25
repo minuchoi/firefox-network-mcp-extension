@@ -46,10 +46,18 @@ The MCP server is configured in `.mcp.json` to launch via `uv run`.
 2. `fetch(url, {cache: "force-cache"})` fallback (GET/HEAD only, when filter produces 0 chunks)
 3. Page-level XHR/fetch hooking via `<script>` tag injection into the page's main world (captures POST response bodies that `filterResponseData` misses due to a Firefox bug with `connection: close` + gzip responses). Note: `wrappedJSObject` prototype overrides do NOT work for this — Firefox's Xray wrappers prevent page-world code from seeing content-script prototype changes. The hook must run in the actual page context. For mutating methods (POST/PUT/DELETE/PATCH), the fetch hook inlines body reading into the promise chain — the caller's `await fetch()` does not resolve until the body is captured and posted, preventing navigation races. For GET/HEAD, a detached (non-blocking) read is used since `filterResponseData` or the cache fallback already handles those. Bodies are correlated with webRequest entries by URL + method + tab ID + timestamp proximity (5s tolerance). Three-stage correlation: pending entry match → buffer lookup → server-side patch of already-stored entries.
 
+**XHR/fetch hook response type handling:**
+- `responseType` "" / "text": reads `xhr.responseText` directly
+- `responseType` "json": serializes `xhr.response` via `JSON.stringify`
+- `responseType` "document" (XML/HTML): serializes via `XMLSerializer().serializeToString()`
+- `responseType` "arraybuffer" / "blob": skipped (binary, not text-representable; `filterResponseData` still captures these as base64)
+- The fetch hook uses `response.clone().text()` which works for all text-based formats (JSON, XML, HTML, plain text) regardless of content-type header.
+
 **Known limitations of the XHR/fetch hook fallback:**
 - Pages with strict `Content-Security-Policy` (`script-src` without `'unsafe-inline'`) will block the `<script>` tag injection. `filterResponseData` still works as primary capture on those pages.
 - Only hooks the top frame — XHR calls from iframes are not hooked (but are still captured by `webRequest` at the network level).
 - Multiple rapid POST requests to the same URL from the same tab may collide in the correlation buffer (keyed by `tabId:method:url`). The primary correlation path (matching pending webRequest entries) handles most cases before the buffer is needed.
+- Brotli (`br`) content-encoding is not supported by `DecompressionStream`. If `filterResponseData` delivers raw brotli bytes, the body will be decoded as latin-1 (garbled). In practice Firefox typically delivers already-decompressed data so this rarely triggers.
 
 **Performance:** Content script injection (XHR hook, console capture) on tab navigation is gated by `isTabMonitored()` — only the monitored tab (or all tabs when none is pinned) gets injected. This avoids unnecessary IPC overhead when many tabs are open.
 
