@@ -229,7 +229,7 @@ The MCP server (`src/mcp_server/server.py`) launches two concurrent async tasks:
 The Firefox extension runs a persistent background script that:
 
 - Connects as a WebSocket client and auto-reconnects with exponential backoff on disconnection.
-- Passively captures all HTTP traffic using Firefox's `webRequest` API. Response bodies are captured via `filterResponseData` (primary) with two fallback mechanisms: cache-based re-fetch for GET requests, and page-level XHR/`fetch` hooking via manifest-declared content script (`document_start`) for POST/PUT/DELETE/PATCH responses where `filterResponseData` produces no data. The hook communicates with the content script relay via synchronous DOM attribute + `dispatchEvent`, avoiding async `postMessage` races with page navigation. URLs are resolved to absolute before correlation. Captured data is stored in in-memory ring buffers -- 500 requests per tab, up to 20 tabs.
+- Passively captures all HTTP traffic using Firefox's `webRequest` API (listeners are registered dynamically and only active when network capture is enabled). Response bodies are captured via `filterResponseData` (primary) with two fallback mechanisms: cache-based re-fetch for GET requests, and page-level XHR/`fetch` hooking via dynamically registered content script (`document_start`) for POST/PUT/DELETE/PATCH responses where `filterResponseData` produces no data. The hook communicates with the content script relay via synchronous DOM attribute + `dispatchEvent`, avoiding async `postMessage` races with page navigation. URLs are resolved to absolute before correlation. Captured data is stored in in-memory ring buffers -- 500 requests per tab, up to 20 tabs.
 - On demand, injects content scripts into the active tab to perform DOM queries, console log interception, and WebSocket frame capture.
 - Correlates requests and responses using UUID-based message IDs with asyncio Futures (5-second timeout on the server side).
 
@@ -276,7 +276,7 @@ This can happen if the response uses brotli (`br`) content-encoding and Firefox'
 
 - The WebSocket server binds to `127.0.0.1` only -- not accessible from the network.
 - No data is persisted to disk. All captured data lives in memory and is lost when the server stops.
-- The extension requires broad permissions (`<all_urls>`, `webRequest`, `webRequestBlocking`, `tabs`, `storage`) to capture network traffic across all sites. This is inherent to the functionality.
+- The extension requires broad permissions (`<all_urls>`, `webRequest`, `webRequestBlocking`, `tabs`, `storage`) to capture network traffic across all sites. This is inherent to the functionality. However, all webRequest listeners and the XHR/fetch content script are only active when the corresponding capability is enabled — when disabled, the extension has near-zero overhead.
 - Use the extension popup toggles to limit data exposure -- disable capabilities you don't need.
 - The extension is loaded as a temporary add-on and must be re-loaded after each Firefox restart.
 

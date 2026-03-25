@@ -1,6 +1,7 @@
 // Content script: sets up the DOM attribute relay AND injects the page-world
-// XHR/fetch hook via <script> tag. Declared in manifest.json as a content_script
-// with run_at: "document_start" for guaranteed pre-page-script timing.
+// XHR/fetch hook via <script> tag. Dynamically registered via
+// browser.contentScripts.register() at document_start for guaranteed
+// pre-page-script timing. Only active when network capability is enabled.
 (function() {
   // --- Relay: content script context, bridges DOM attribute -> runtime.sendMessage ---
   // Uses dispatchEvent(new Event()) as a synchronous signal, with data passed via a

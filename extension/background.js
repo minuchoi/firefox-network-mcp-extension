@@ -28,6 +28,10 @@ const consoleInjectedTabs = new Set();
 
 // XHR/fetch hook injection tracking
 const xhrHookInjectedTabs = new Set();
+// Dynamic content script registration handle (browser.contentScripts.register)
+let xhrHookRegistration = null;
+// Whether webRequest listeners are currently registered
+let webRequestListenersActive = false;
 // Buffer for XHR-captured bodies awaiting correlation with webRequest entries
 // Key: "tabId:method:url", Value: { response_body, timestamp }
 const xhrBodyBuffer = new Map();
@@ -547,11 +551,11 @@ async function injectXhrHook(tabId) {
   }
 }
 
-// XHR/fetch hook is declared in manifest.json as a content_script with
-// run_at: "document_start" for the strongest timing guarantee. No dynamic
-// registration needed — it always runs on every page. The hook is lightweight
-// for GET/HEAD (passes through to original fetch with zero overhead) and only
-// adds inline body reading for mutating methods (POST/PUT/DELETE/PATCH).
+// XHR/fetch hook is registered dynamically via browser.contentScripts.register()
+// when network capability is enabled, and unregistered when disabled. This avoids
+// wrapping XHR/fetch on every page when network capture is off. The hook runs at
+// document_start for guaranteed pre-page-script timing, passes through GET/HEAD
+// with zero overhead, and only captures bodies for mutating methods (POST/PUT/DELETE/PATCH).
 
 function correlateXhrBody(msg, tabId) {
   const { method, url, timestamp, status, response_body } = msg;
@@ -784,209 +788,282 @@ function cleanupEntry(key) {
   pendingRequests.delete(key);
 }
 
-browser.webRequest.onBeforeRequest.addListener(
-  (details) => {
-    if (!isTabMonitored(details.tabId)) return;
+// Skip response body capture for URLs that are obviously binary assets or
+// static resources. filterResponseData has significant per-request IPC
+// overhead, so avoid it for resources we'd never inspect for API debugging.
+const SKIP_URL_EXTS = /\.(png|jpe?g|gif|webp|avif|ico|svg|woff2?|ttf|otf|eot|mp[34]|webm|ogg|wav|flac|pdf|zip|gz|br|wasm|js|mjs|css)(\?|$)/i;
 
-    // Track WebSocket upgrade requests regardless of network capability
-    if (details.url.startsWith("ws://") || details.url.startsWith("wss://")) {
-      if (capabilities.websocket) {
-        if (trackedWsConnections.size >= MAX_WS_CONNECTIONS) {
-          const firstKey = trackedWsConnections.keys().next().value;
-          trackedWsConnections.delete(firstKey);
-        }
-        const tabIds = trackedWsConnections.get(details.url);
-        if (tabIds) {
-          tabIds.add(details.tabId);
-        } else {
-          trackedWsConnections.set(details.url, new Set([details.tabId]));
+// ─── Named webRequest handlers (for dynamic add/remove) ─────────────────────
+
+function onBeforeRequestHandler(details) {
+  if (!isTabMonitored(details.tabId)) return;
+
+  // Track WebSocket upgrade requests regardless of network capability
+  if (details.url.startsWith("ws://") || details.url.startsWith("wss://")) {
+    if (capabilities.websocket) {
+      if (trackedWsConnections.size >= MAX_WS_CONNECTIONS) {
+        const firstKey = trackedWsConnections.keys().next().value;
+        trackedWsConnections.delete(firstKey);
+      }
+      const tabIds = trackedWsConnections.get(details.url);
+      if (tabIds) {
+        tabIds.add(details.tabId);
+      } else {
+        trackedWsConnections.set(details.url, new Set([details.tabId]));
+      }
+    }
+    return;
+  }
+
+  if (!capabilities.network) return;
+
+  const key = pendingKey(details.tabId, details.requestId);
+
+  const entry = {
+    request_id: String(details.requestId),
+    tab_id: details.tabId,
+    url: details.url,
+    method: details.method,
+    timestamp: details.timeStamp,
+    request_body: null,
+    request_headers: {},
+    status_code: null,
+    response_headers: {},
+    response_body: null,
+    content_type: null,
+    ip: null,
+    response_body_truncated: false,
+    _filterDone: false,
+    _completeDone: false,
+
+    _fallbackTimer: null,
+    _hardTimer: null,
+  };
+
+  // Capture request body
+  if (details.requestBody) {
+    if (details.requestBody.formData) {
+      entry.request_body = JSON.stringify(details.requestBody.formData);
+    } else if (details.requestBody.raw) {
+      try {
+        const decoder = new TextDecoder();
+        const parts = details.requestBody.raw.map((p) =>
+          p.bytes ? decoder.decode(p.bytes) : p.file ? `[file: ${p.file}]` : ""
+        );
+        entry.request_body = parts.join("");
+      } catch {
+        entry.request_body = "[binary data]";
+      }
+    }
+  }
+
+  // Evict oldest entry if we've hit the size cap
+  if (pendingRequests.size >= MAX_PENDING_REQUESTS) {
+    const oldestKey = pendingRequests.keys().next().value;
+    cleanupEntry(oldestKey);
+  }
+
+  pendingRequests.set(key, entry);
+
+  // Hard timeout: evict orphaned entries that never complete
+  entry._hardTimer = setTimeout(() => {
+    cleanupEntry(key);
+  }, PENDING_REQUEST_TIMEOUT_MS);
+
+  if (SKIP_URL_EXTS.test(details.url)) {
+    entry._filterDone = true;
+  }
+
+  // Set up response body capture via filterResponseData (Firefox-specific)
+  if (!entry._filterDone) try {
+    const filter = browser.webRequest.filterResponseData(details.requestId);
+    const chunks = [];
+    let totalSize = 0;
+    let truncated = false;
+
+    filter.ondata = (event) => {
+      // CRITICAL: always pass data through to avoid hanging the browser
+      filter.write(event.data);
+
+      if (!truncated && totalSize < MAX_BODY_SIZE) {
+        chunks.push(new Uint8Array(event.data));
+        totalSize += event.data.byteLength;
+        if (totalSize >= MAX_BODY_SIZE) {
+          truncated = true;
         }
       }
-      return;
-    }
-
-    if (!capabilities.network) return;
-
-    const key = pendingKey(details.tabId, details.requestId);
-
-    const entry = {
-      request_id: String(details.requestId),
-      tab_id: details.tabId,
-      url: details.url,
-      method: details.method,
-      timestamp: details.timeStamp,
-      request_body: null,
-      request_headers: {},
-      status_code: null,
-      response_headers: {},
-      response_body: null,
-      content_type: null,
-      ip: null,
-      response_body_truncated: false,
-      _filterDone: false,
-      _completeDone: false,
-
-      _fallbackTimer: null,
-      _hardTimer: null,
     };
 
-    // Capture request body
-    if (details.requestBody) {
-      if (details.requestBody.formData) {
-        entry.request_body = JSON.stringify(details.requestBody.formData);
-      } else if (details.requestBody.raw) {
-        try {
-          const decoder = new TextDecoder();
-          const parts = details.requestBody.raw.map((p) =>
-            p.bytes ? decoder.decode(p.bytes) : p.file ? `[file: ${p.file}]` : ""
-          );
-          entry.request_body = parts.join("");
-        } catch {
-          entry.request_body = "[binary data]";
-        }
+    filter.onstop = () => {
+      filter.close();
+
+      const pending = pendingRequests.get(key);
+      if (pending) {
+        pending.response_body_truncated = truncated;
+        // Store raw chunks — decoding happens in maybeSendEntry once headers are available
+        pending._rawChunks = chunks;
+        pending._filterDone = true;
+        maybeSendEntry(key);
+      }
+    };
+
+    filter.onerror = (event) => {
+      console.warn("[BrowserBridge] Response filter error for", details.url, filter.error);
+      try { filter.close(); } catch {}
+      const pending = pendingRequests.get(key);
+      if (pending) {
+        pending._filterDone = true;
+        maybeSendEntry(key);
+      }
+    };
+  } catch (err) {
+    // filterResponseData not available (cached, service worker, etc.)
+    console.debug("[BrowserBridge] filterResponseData unavailable for", details.url, err.message);
+    entry._filterDone = true;
+  }
+}
+
+function onSendHeadersHandler(details) {
+  if (!capabilities.network) return;
+
+  const key = pendingKey(details.tabId, details.requestId);
+  const entry = pendingRequests.get(key);
+  if (entry && details.requestHeaders) {
+    const headers = {};
+    for (const h of details.requestHeaders) {
+      headers[h.name.toLowerCase()] = h.value || "";
+    }
+    entry.request_headers = headers;
+  }
+}
+
+function onCompletedHandler(details) {
+  if (!capabilities.network) return;
+
+  const key = pendingKey(details.tabId, details.requestId);
+  const entry = pendingRequests.get(key);
+  if (!entry) return;
+
+  entry.status_code = details.statusCode;
+  entry.ip = details.ip || null;
+
+  if (details.responseHeaders) {
+    const headers = {};
+    for (const h of details.responseHeaders) {
+      headers[h.name.toLowerCase()] = h.value || "";
+      if (h.name.toLowerCase() === "content-type") {
+        entry.content_type = h.value;
       }
     }
+    entry.response_headers = headers;
+  }
 
-    // Evict oldest entry if we've hit the size cap
-    if (pendingRequests.size >= MAX_PENDING_REQUESTS) {
-      const oldestKey = pendingRequests.keys().next().value;
-      cleanupEntry(oldestKey);
-    }
+  entry._completeDone = true;
 
-    pendingRequests.set(key, entry);
-
-    // Hard timeout: evict orphaned entries that never complete
-    entry._hardTimer = setTimeout(() => {
-      cleanupEntry(key);
-    }, PENDING_REQUEST_TIMEOUT_MS);
-
-    // Skip response body capture for URLs that are obviously binary assets.
-    // filterResponseData has significant per-request IPC overhead, so avoid it
-    // for resources we'd never decode anyway.
-    const SKIP_URL_EXTS = /\.(png|jpe?g|gif|webp|avif|ico|svg|woff2?|ttf|otf|eot|mp[34]|webm|ogg|wav|flac|pdf|zip|gz|br|wasm)(\?|$)/i;
-    if (SKIP_URL_EXTS.test(details.url)) {
-      entry._filterDone = true;
-    }
-
-    // Set up response body capture via filterResponseData (Firefox-specific)
-    if (!entry._filterDone) try {
-      const filter = browser.webRequest.filterResponseData(details.requestId);
-      const chunks = [];
-      let totalSize = 0;
-      let truncated = false;
-
-      filter.ondata = (event) => {
-        // CRITICAL: always pass data through to avoid hanging the browser
-        filter.write(event.data);
-
-        if (!truncated && totalSize < MAX_BODY_SIZE) {
-          chunks.push(new Uint8Array(event.data));
-          totalSize += event.data.byteLength;
-          if (totalSize >= MAX_BODY_SIZE) {
-            truncated = true;
-          }
-        }
-      };
-
-      filter.onstop = () => {
-        filter.close();
-
-        const pending = pendingRequests.get(key);
-        if (pending) {
-          pending.response_body_truncated = truncated;
-          // Store raw chunks — decoding happens in maybeSendEntry once headers are available
-          pending._rawChunks = chunks;
-          pending._filterDone = true;
-          maybeSendEntry(key);
-        }
-      };
-
-      filter.onerror = (event) => {
-        console.warn("[BrowserBridge] Response filter error for", details.url, filter.error);
-        try { filter.close(); } catch {}
-        const pending = pendingRequests.get(key);
-        if (pending) {
-          pending._filterDone = true;
-          maybeSendEntry(key);
-        }
-      };
-    } catch (err) {
-      // filterResponseData not available (cached, service worker, etc.)
-      console.debug("[BrowserBridge] filterResponseData unavailable for", details.url, err.message);
-      entry._filterDone = true;
-    }
-  },
-  { urls: ["<all_urls>"] },
-  ["requestBody"]
-);
-
-browser.webRequest.onSendHeaders.addListener(
-  (details) => {
-    if (!capabilities.network) return;
-
-    const key = pendingKey(details.tabId, details.requestId);
-    const entry = pendingRequests.get(key);
-    if (entry && details.requestHeaders) {
-      const headers = {};
-      for (const h of details.requestHeaders) {
-        headers[h.name.toLowerCase()] = h.value || "";
+  // If filter is already done, send immediately
+  if (entry._filterDone) {
+    maybeSendEntry(key);
+  } else {
+    // Set a fallback timeout in case the filter never fires
+    entry._fallbackTimer = setTimeout(() => {
+      const pending = pendingRequests.get(key);
+      if (pending && !pending._filterDone) {
+        pending._filterDone = true;
+        maybeSendEntry(key);
       }
-      entry.request_headers = headers;
-    }
-  },
-  { urls: ["<all_urls>"] },
-  ["requestHeaders"]
-);
+    }, FILTER_FALLBACK_TIMEOUT_MS);
+  }
+}
 
-browser.webRequest.onCompleted.addListener(
-  (details) => {
-    if (!capabilities.network) return;
+function onErrorOccurredHandler(details) {
+  const key = pendingKey(details.tabId, details.requestId);
+  cleanupEntry(key);
+}
 
-    const key = pendingKey(details.tabId, details.requestId);
-    const entry = pendingRequests.get(key);
-    if (!entry) return;
+// ─── Dynamic webRequest listener registration ────────────────────────────────
 
-    entry.status_code = details.statusCode;
-    entry.ip = details.ip || null;
+function registerWebRequestListeners() {
+  if (webRequestListenersActive) return;
+  browser.webRequest.onBeforeRequest.addListener(
+    onBeforeRequestHandler,
+    { urls: ["<all_urls>"] },
+    ["requestBody"]
+  );
+  browser.webRequest.onSendHeaders.addListener(
+    onSendHeadersHandler,
+    { urls: ["<all_urls>"] },
+    ["requestHeaders"]
+  );
+  browser.webRequest.onCompleted.addListener(
+    onCompletedHandler,
+    { urls: ["<all_urls>"] },
+    ["responseHeaders"]
+  );
+  browser.webRequest.onErrorOccurred.addListener(
+    onErrorOccurredHandler,
+    { urls: ["<all_urls>"] }
+  );
+  webRequestListenersActive = true;
+  console.log("[BrowserBridge] webRequest listeners registered");
+}
 
-    if (details.responseHeaders) {
-      const headers = {};
-      for (const h of details.responseHeaders) {
-        headers[h.name.toLowerCase()] = h.value || "";
-        if (h.name.toLowerCase() === "content-type") {
-          entry.content_type = h.value;
-        }
-      }
-      entry.response_headers = headers;
-    }
+function unregisterWebRequestListeners() {
+  if (!webRequestListenersActive) return;
+  browser.webRequest.onBeforeRequest.removeListener(onBeforeRequestHandler);
+  browser.webRequest.onSendHeaders.removeListener(onSendHeadersHandler);
+  browser.webRequest.onCompleted.removeListener(onCompletedHandler);
+  browser.webRequest.onErrorOccurred.removeListener(onErrorOccurredHandler);
+  webRequestListenersActive = false;
+  console.log("[BrowserBridge] webRequest listeners unregistered");
+}
 
-    entry._completeDone = true;
+// ─── Dynamic XHR/fetch content script registration ───────────────────────────
 
-    // If filter is already done, send immediately
-    if (entry._filterDone) {
-      maybeSendEntry(key);
-    } else {
-      // Set a fallback timeout in case the filter never fires
-      entry._fallbackTimer = setTimeout(() => {
-        const pending = pendingRequests.get(key);
-        if (pending && !pending._filterDone) {
-          pending._filterDone = true;
-          maybeSendEntry(key);
-        }
-      }, FILTER_FALLBACK_TIMEOUT_MS);
-    }
-  },
-  { urls: ["<all_urls>"] },
-  ["responseHeaders"]
-);
+async function registerXhrHookContentScript() {
+  if (xhrHookRegistration) return;
+  try {
+    xhrHookRegistration = await browser.contentScripts.register({
+      matches: ["<all_urls>"],
+      js: [{ file: "xhr_hook_content.js" }],
+      runAt: "document_start",
+      allFrames: false,
+    });
+    console.log("[BrowserBridge] XHR/fetch content script registered");
+  } catch (err) {
+    console.error("[BrowserBridge] Failed to register XHR hook content script:", err);
+  }
+}
 
-browser.webRequest.onErrorOccurred.addListener(
-  (details) => {
-    const key = pendingKey(details.tabId, details.requestId);
-    cleanupEntry(key);
-  },
-  { urls: ["<all_urls>"] }
-);
+async function unregisterXhrHookContentScript() {
+  if (!xhrHookRegistration) return;
+  try {
+    await xhrHookRegistration.unregister();
+  } catch (err) {
+    console.warn("[BrowserBridge] Failed to unregister XHR hook content script:", err);
+  }
+  xhrHookRegistration = null;
+  console.log("[BrowserBridge] XHR/fetch content script unregistered");
+}
+
+// ─── Capability-driven listener management ───────────────────────────────────
+// Registers or unregisters webRequest listeners and XHR hook based on whether
+// network or websocket capabilities are enabled. Called on capability toggle
+// and on startup after loading persisted capabilities.
+
+function updateListenerRegistrations() {
+  const needWebRequest = capabilities.network || capabilities.websocket;
+  if (needWebRequest) {
+    registerWebRequestListeners();
+  } else {
+    unregisterWebRequestListeners();
+  }
+
+  if (capabilities.network) {
+    registerXhrHookContentScript();
+  } else {
+    unregisterXhrHookContentScript();
+  }
+}
 
 // Re-inject captures on navigation when capabilities are on, and clean up stale WS connections
 browser.tabs.onUpdated.addListener((tabId, changeInfo) => {
@@ -1004,10 +1081,9 @@ browser.tabs.onUpdated.addListener((tabId, changeInfo) => {
         setTimeout(() => injectConsoleCapture(tabId), 100);
       }
 
-      // XHR/fetch hook is handled by the registered content script
-      // (registerXhrHook) which runs at document_start with manifest-level
-      // timing. No need for executeScript here — it would race with page
-      // scripts and lose.
+      // XHR/fetch hook is handled by the dynamically registered content script
+      // (registerXhrHookContentScript) which runs at document_start. No need
+      // for executeScript here — it would race with page scripts and lose.
     }
 
     // Clean up tracked WS connections for this tab on navigation
@@ -1026,6 +1102,10 @@ browser.tabs.onRemoved.addListener((tabId) => {
   xhrHookInjectedTabs.delete(tabId);
   if (monitoredTabId === tabId) {
     monitoredTabId = null;
+  }
+  // Clean up pending requests for the closed tab
+  for (const [key, entry] of pendingRequests) {
+    if (entry.tab_id === tabId) cleanupEntry(key);
   }
   for (const [url, tabIds] of trackedWsConnections) {
     tabIds.delete(tabId);
@@ -1227,8 +1307,10 @@ browser.runtime.onMessage.addListener((msg, sender, sendResponse) => {
             await injectConsoleCapture(tab.id);
           }
         }
-        // XHR/fetch hook is always active via manifest content_scripts —
-        // no dynamic registration needed
+        // Update webRequest listeners and XHR hook based on new capability state
+        if (name === "network" || name === "websocket") {
+          updateListenerRegistrations();
+        }
         sendResponse({ ok: true, capabilities: { ...capabilities } });
       }).catch((err) => {
         console.error("[BrowserBridge] Failed to save capability:", err);
@@ -1263,6 +1345,9 @@ browser.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 loadCapabilities().then(async () => {
   connect();
 
+  // Register webRequest listeners and XHR hook based on persisted capabilities
+  updateListenerRegistrations();
+
   // Eagerly inject console capture into the active tab on startup
   if (capabilities.console) {
     try {
@@ -1274,7 +1359,4 @@ loadCapabilities().then(async () => {
       // May fail on privileged pages — ignore
     }
   }
-
-  // XHR/fetch hook is always active via manifest content_scripts —
-  // no dynamic registration or injection needed on startup
 });
