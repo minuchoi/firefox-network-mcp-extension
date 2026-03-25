@@ -37,7 +37,7 @@ let webRequestListenersActive = false;
 const xhrBodyBuffer = new Map();
 const XHR_BODY_BUFFER_MAX = 500;
 
-// Tab monitoring: null means all tabs
+// Tab monitoring: always a specific tab ID (set to active tab on startup)
 let monitoredTabId = null;
 
 function isTabMonitored(tabId) {
@@ -1334,7 +1334,7 @@ browser.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   }
 
   if (msg.type === "set_monitored_tab") {
-    monitoredTabId = msg.tabId; // null = all tabs
+    monitoredTabId = msg.tabId;
     sendResponse({ ok: true, monitoredTabId });
     return;
   }
@@ -1345,16 +1345,23 @@ browser.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 loadCapabilities().then(async () => {
   connect();
 
+  // Auto-select the active tab on startup so we never monitor all tabs
+  try {
+    const tabs = await browser.tabs.query({ active: true, currentWindow: true });
+    if (tabs.length > 0) {
+      monitoredTabId = tabs[0].id;
+    }
+  } catch {
+    // Will remain null until a tab is selected via popup
+  }
+
   // Register webRequest listeners and XHR hook based on persisted capabilities
   updateListenerRegistrations();
 
-  // Eagerly inject console capture into the active tab on startup
-  if (capabilities.console) {
+  // Eagerly inject console capture into the monitored tab on startup
+  if (capabilities.console && monitoredTabId !== null) {
     try {
-      const tabs = await browser.tabs.query({ active: true, currentWindow: true });
-      if (tabs.length > 0) {
-        await injectConsoleCapture(tabs[0].id);
-      }
+      await injectConsoleCapture(monitoredTabId);
     } catch {
       // May fail on privileged pages — ignore
     }

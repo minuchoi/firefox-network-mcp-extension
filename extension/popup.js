@@ -67,8 +67,8 @@ function loadTabs() {
     if (!response || !response.tabs) return;
     const { tabs, monitoredTabId } = response;
 
-    // Clear existing options except "All Tabs"
-    tabSelect.length = 1;
+    // Clear all options and rebuild
+    tabSelect.length = 0;
 
     for (const tab of tabs) {
       const opt = document.createElement("option");
@@ -79,10 +79,13 @@ function loadTabs() {
       tabSelect.appendChild(opt);
     }
 
-    // Validate monitored tab still exists in the list
-    const valueToSet = monitoredTabId === null ? "all" : String(monitoredTabId);
-    const validValues = new Set(Array.from(tabSelect.options).map((o) => o.value));
-    tabSelect.value = validValues.has(valueToSet) ? valueToSet : "all";
+    // Select the currently monitored tab, or fall back to first tab
+    if (monitoredTabId !== null) {
+      tabSelect.value = String(monitoredTabId);
+    }
+    if (!tabSelect.value && tabSelect.options.length > 0) {
+      tabSelect.value = tabSelect.options[0].value;
+    }
   }).catch((err) => {
     console.error("[BrowserBridge Popup] Failed to load tabs:", err);
   });
@@ -109,8 +112,7 @@ window.addEventListener("unload", () => clearInterval(statsInterval));
 
 // Handle tab selector changes
 tabSelect.addEventListener("change", () => {
-  const value = tabSelect.value;
-  const tabId = value === "all" ? null : Number(value);
+  const tabId = Number(tabSelect.value);
 
   browser.runtime.sendMessage({
     type: "set_monitored_tab",

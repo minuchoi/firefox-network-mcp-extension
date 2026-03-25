@@ -63,6 +63,7 @@ The MCP server is configured in `.mcp.json` to launch via `uv run`.
 - All webRequest listeners and the XHR/fetch content script are registered dynamically based on capability toggles. When network capture is off, zero webRequest listeners are active and no content scripts are injected — the extension has near-zero overhead on browsing.
 - The XHR/fetch page-world hook is registered via `browser.contentScripts.register()` at `document_start` and only intercepts mutating methods (POST/PUT/DELETE/PATCH). GET/HEAD requests pass through the original `fetch`/`XHR.send` with zero overhead.
 - `filterResponseData` is skipped for obviously binary URLs (images, fonts, video, wasm) and static assets (`.js`, `.mjs`, `.css`) to avoid unnecessary per-request IPC overhead.
+- Tab monitoring is always scoped to a single tab (no "all tabs" mode) to avoid the IPC overhead of `filterResponseData` and webRequest handlers firing across all open tabs. The active tab is auto-selected on extension startup.
 - Console capture injection on tab navigation is gated by `isTabMonitored()`.
 - Pending requests for a tab are cleaned up when the tab is closed, preventing stale entry accumulation.
 
