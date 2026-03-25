@@ -44,12 +44,14 @@ The MCP server is configured in `.mcp.json` to launch via `uv run`.
 **Response body capture** has three layers of fallback:
 1. `filterResponseData` stream filter (primary — works for most responses)
 2. `fetch(url, {cache: "force-cache"})` fallback (GET/HEAD only, when filter produces 0 chunks)
-3. Page-level XHR/fetch hooking via `<script>` tag injection into the page's main world (captures POST response bodies that `filterResponseData` misses due to a Firefox bug with `connection: close` + gzip responses). Note: `wrappedJSObject` prototype overrides do NOT work for this — Firefox's Xray wrappers prevent page-world code from seeing content-script prototype changes. The hook must run in the actual page context. The fetch hook inlines body reading into the promise chain — the caller's `await fetch()` does not resolve until the body is captured and posted, preventing navigation races. Bodies are correlated with webRequest entries by URL + method + tab ID + timestamp proximity (5s tolerance). Three-stage correlation: pending entry match → buffer lookup → server-side patch of already-stored entries.
+3. Page-level XHR/fetch hooking via `<script>` tag injection into the page's main world (captures POST response bodies that `filterResponseData` misses due to a Firefox bug with `connection: close` + gzip responses). Note: `wrappedJSObject` prototype overrides do NOT work for this — Firefox's Xray wrappers prevent page-world code from seeing content-script prototype changes. The hook must run in the actual page context. For mutating methods (POST/PUT/DELETE/PATCH), the fetch hook inlines body reading into the promise chain — the caller's `await fetch()` does not resolve until the body is captured and posted, preventing navigation races. For GET/HEAD, a detached (non-blocking) read is used since `filterResponseData` or the cache fallback already handles those. Bodies are correlated with webRequest entries by URL + method + tab ID + timestamp proximity (5s tolerance). Three-stage correlation: pending entry match → buffer lookup → server-side patch of already-stored entries.
 
 **Known limitations of the XHR/fetch hook fallback:**
 - Pages with strict `Content-Security-Policy` (`script-src` without `'unsafe-inline'`) will block the `<script>` tag injection. `filterResponseData` still works as primary capture on those pages.
 - Only hooks the top frame — XHR calls from iframes are not hooked (but are still captured by `webRequest` at the network level).
 - Multiple rapid POST requests to the same URL from the same tab may collide in the correlation buffer (keyed by `tabId:method:url`). The primary correlation path (matching pending webRequest entries) handles most cases before the buffer is needed.
+
+**Performance:** Content script injection (XHR hook, console capture) on tab navigation is gated by `isTabMonitored()` — only the monitored tab (or all tabs when none is pinned) gets injected. This avoids unnecessary IPC overhead when many tabs are open.
 
 **Storage:** In-memory ring buffers in `request_store.py` — 500 requests/tab (max 20 tabs), 500 frames/connection URL. No persistence.
 
@@ -88,6 +90,10 @@ Both runtimes are **single-threaded** — be aware of this during code review:
 - **JavaScript (extension):** Single event loop, no preemption. Functions run to completion before the next event is processed.
 
 The only actual thread is the `ThreadPoolExecutor(max_workers=1)` in `request_store.py` for regex timeout enforcement.
+
+## Workflow Rules
+
+- **Every code change must update docs and commit**: After any fix, feature, or refactor, update this `CLAUDE.md` and `README.md` to reflect the change, then commit everything together. Never leave docs out of sync with code.
 
 ## Tech Stack
 
