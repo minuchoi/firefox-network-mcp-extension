@@ -44,7 +44,7 @@ The MCP server is configured in `.mcp.json` to launch via `uv run`.
 **Response body capture** has three layers of fallback:
 1. `filterResponseData` stream filter (primary — works for most responses)
 2. `fetch(url, {cache: "force-cache"})` fallback (GET/HEAD only, when filter produces 0 chunks)
-3. Page-level XHR/fetch hooking via `<script>` tag injection into the page's main world (captures POST response bodies that `filterResponseData` misses due to a Firefox bug with gzip-encoded responses). Note: `wrappedJSObject` prototype overrides do NOT work for this — Firefox's Xray wrappers prevent page-world code from seeing content-script prototype changes. The hook must run in the actual page context. The hook is registered via `browser.contentScripts.register()` (not `executeScript`) to guarantee manifest-level `document_start` timing — this ensures `window.fetch` and `XMLHttpRequest` are hooked BEFORE any page scripts can capture references to the originals. For mutating methods (POST/PUT/DELETE/PATCH), the fetch hook inlines body reading into the promise chain — the caller's `await fetch()` does not resolve until the body is captured and posted, preventing navigation races. For GET/HEAD, a detached (non-blocking) read is used since `filterResponseData` or the cache fallback already handles those. Bodies are correlated with webRequest entries by URL + method + tab ID + timestamp proximity (5s tolerance). Three-stage correlation: pending entry match → buffer lookup → server-side patch of already-stored entries.
+3. Page-level XHR/fetch hooking via `<script>` tag injection into the page's main world (captures POST response bodies that `filterResponseData` misses due to a Firefox bug with gzip-encoded responses). Note: `wrappedJSObject` prototype overrides do NOT work for this — Firefox's Xray wrappers prevent page-world code from seeing content-script prototype changes. The hook must run in the actual page context. The hook is declared in `manifest.json` as a content script with `run_at: "document_start"` for the strongest timing guarantee — this ensures `window.fetch` and `XMLHttpRequest` are hooked BEFORE any page scripts can capture references to the originals. Only mutating methods (POST/PUT/DELETE/PATCH) are intercepted; GET/HEAD pass through with zero overhead. Communication from the page-world hook to the content script relay uses `document.dispatchEvent(new CustomEvent(...))` instead of `window.postMessage` — `dispatchEvent` is **synchronous**, so the content script relay fires immediately within the XHR load handler, before the page can navigate away. This was critical for sites (like those using Axios) where a POST response triggers an immediate full-page navigation. Bodies are correlated with webRequest entries by URL + method + tab ID + timestamp proximity (5s tolerance). Three-stage correlation: pending entry match → buffer lookup → server-side patch of already-stored entries.
 
 **XHR/fetch hook response type handling:**
 - `responseType` "" / "text": reads `xhr.responseText` directly
@@ -59,7 +59,10 @@ The MCP server is configured in `.mcp.json` to launch via `uv run`.
 - Multiple rapid POST requests to the same URL from the same tab may collide in the correlation buffer (keyed by `tabId:method:url`). The primary correlation path (matching pending webRequest entries) handles most cases before the buffer is needed.
 - Brotli (`br`) content-encoding is not supported by `DecompressionStream`. If `filterResponseData` delivers raw brotli bytes, the body will be decoded as latin-1 (garbled). In practice Firefox typically delivers already-decompressed data so this rarely triggers.
 
-**Performance:** Content script injection (XHR hook, console capture) on tab navigation is gated by `isTabMonitored()` — only the monitored tab (or all tabs when none is pinned) gets injected. This avoids unnecessary IPC overhead when many tabs are open.
+**Performance:**
+- The XHR/fetch page-world hook is declared in `manifest.json` as a content script (`run_at: "document_start"`) and only intercepts mutating methods (POST/PUT/DELETE/PATCH). GET/HEAD requests pass through the original `fetch`/`XHR.send` with zero overhead.
+- `filterResponseData` is skipped for obviously binary URLs (images, fonts, video, wasm, etc.) to avoid unnecessary per-request IPC overhead.
+- Console capture injection on tab navigation is gated by `isTabMonitored()`.
 
 **Storage:** In-memory ring buffers in `request_store.py` — 500 requests/tab (max 20 tabs), 500 frames/connection URL. No persistence.
 
@@ -69,7 +72,8 @@ The MCP server is configured in `.mcp.json` to launch via `uv run`.
 - `src/mcp_server/tools.py` — All MCP tool definitions and dispatch logic (match/case)
 - `src/mcp_server/ws_bridge.py` — WebSocket server, ConnectionManager, message routing
 - `src/mcp_server/request_store.py` — RequestStore and WsFrameStore ring buffers
-- `extension/background.js` — All extension logic (WS client, network capture, XHR/fetch body hooking, DOM tools, WS frame capture, capability toggles)
+- `extension/background.js` — All extension logic (WS client, network capture, DOM tools, WS frame capture, capability toggles)
+- `extension/xhr_hook_content.js` — Content script for XHR/fetch body capture, registered via `contentScripts.register()` at `document_start`
 - `extension/popup.html` — Popup UI for toggling capabilities and viewing connection status
 - `extension/popup.js` — Popup script communicating with background.js via runtime messaging
 
@@ -101,7 +105,8 @@ The only actual thread is the `ThreadPoolExecutor(max_workers=1)` in `request_st
 
 ## Workflow Rules
 
-- **Every code change must update docs and commit**: After any fix, feature, or refactor, update this `CLAUDE.md` and `README.md` to reflect the change, then commit everything together. Never leave docs out of sync with code.
+- **Every code change must update docs**: After any fix, feature, or refactor, update this `CLAUDE.md` and `README.md` to reflect the change. Never leave docs out of sync with code.
+- **Do not commit or push unless explicitly asked**: Only stage, commit, or push when the user requests it. Batch changes together to avoid excessive commits.
 
 ## Tech Stack
 

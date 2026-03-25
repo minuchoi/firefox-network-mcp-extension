@@ -229,7 +229,7 @@ The MCP server (`src/mcp_server/server.py`) launches two concurrent async tasks:
 The Firefox extension runs a persistent background script that:
 
 - Connects as a WebSocket client and auto-reconnects with exponential backoff on disconnection.
-- Passively captures all HTTP traffic using Firefox's `webRequest` API. Response bodies are captured via `filterResponseData` (primary) with two fallback mechanisms: cache-based re-fetch for GET requests, and page-level XHR/`fetch` hooking via `<script>` tag injection for POST responses where `filterResponseData` produces no data. The XHR/fetch hook is registered via `browser.contentScripts.register()` for guaranteed `document_start` timing, ensuring it hooks `window.fetch` before any page scripts can capture a reference to the original. For mutating requests (POST/PUT/DELETE/PATCH), the fetch hook inlines body reading into the promise chain to prevent navigation races; GET/HEAD uses a non-blocking detached read. Captured data is stored in in-memory ring buffers -- 500 requests per tab, up to 20 tabs.
+- Passively captures all HTTP traffic using Firefox's `webRequest` API. Response bodies are captured via `filterResponseData` (primary) with two fallback mechanisms: cache-based re-fetch for GET requests, and page-level XHR/`fetch` hooking via manifest-declared content script (`document_start`) for POST/PUT/DELETE/PATCH responses where `filterResponseData` produces no data. The hook communicates with the content script relay via synchronous DOM attribute + `dispatchEvent`, avoiding async `postMessage` races with page navigation. URLs are resolved to absolute before correlation. Captured data is stored in in-memory ring buffers -- 500 requests per tab, up to 20 tabs.
 - On demand, injects content scripts into the active tab to perform DOM queries, console log interception, and WebSocket frame capture.
 - Correlates requests and responses using UUID-based message IDs with asyncio Futures (5-second timeout on the server side).
 
@@ -243,7 +243,8 @@ Only a single extension connection is allowed at a time.
 | `src/mcp_server/tools.py` | MCP tool definitions and dispatch logic |
 | `src/mcp_server/ws_bridge.py` | WebSocket server, connection manager, message routing |
 | `src/mcp_server/request_store.py` | In-memory ring buffer stores for requests and WS frames |
-| `extension/background.js` | All extension logic: WS client, network capture, XHR/fetch body hooking, DOM tools, WS frame capture |
+| `extension/background.js` | All extension logic: WS client, network capture, DOM tools, WS frame capture |
+| `extension/xhr_hook_content.js` | Content script for XHR/fetch response body capture (registered at `document_start`) |
 
 ## Troubleshooting
 

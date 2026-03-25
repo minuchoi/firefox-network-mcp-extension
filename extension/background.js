@@ -28,8 +28,6 @@ const consoleInjectedTabs = new Set();
 
 // XHR/fetch hook injection tracking
 const xhrHookInjectedTabs = new Set();
-// Registered content script handle for the XHR/fetch hook (browser.contentScripts.register)
-let registeredXhrHook = null;
 // Buffer for XHR-captured bodies awaiting correlation with webRequest entries
 // Key: "tabId:method:url", Value: { response_body, timestamp }
 const xhrBodyBuffer = new Map();
@@ -417,13 +415,16 @@ const XHR_PAGE_HOOK = `(function() {
   var xhrMeta = new WeakMap();
 
   XHR.open = function(method, url) {
-    xhrMeta.set(this, { method: method, url: typeof url === "string" ? url : String(url), timestamp: Date.now() });
+    var resolvedUrl; try { resolvedUrl = new URL(typeof url === "string" ? url : String(url), location.href).href; } catch(e) { resolvedUrl = typeof url === "string" ? url : String(url); }
+    xhrMeta.set(this, { method: method, url: resolvedUrl, timestamp: Date.now() });
     return origOpen.apply(this, arguments);
   };
 
   XHR.send = function() {
     var meta = xhrMeta.get(this);
-    if (meta) {
+    // Only intercept mutating methods — GET/HEAD are handled by filterResponseData
+    var um = meta && meta.method.toUpperCase();
+    if (meta && um !== "GET" && um !== "HEAD") {
       var xhr = this;
       xhr.addEventListener("load", function() {
         try {
@@ -442,14 +443,17 @@ const XHR_PAGE_HOOK = `(function() {
             body = null;
           }
           if (body && body.length > 0) {
-            window.postMessage({
-              __browserBridgeXhrBody: true,
-              method: meta.method,
-              url: meta.url,
-              timestamp: meta.timestamp,
-              status: xhr.status,
-              response_body: body.length > MAX_BODY ? body.slice(0, MAX_BODY) : body,
-            }, "*");
+            var el = document.getElementById("__bb_data");
+            if (el) {
+              el.setAttribute("data-body", JSON.stringify({
+                method: meta.method,
+                url: meta.url,
+                timestamp: meta.timestamp,
+                status: xhr.status,
+                response_body: body.length > MAX_BODY ? body.slice(0, MAX_BODY) : body,
+              }));
+              document.dispatchEvent(new Event("__bb_body"));
+            }
           }
         } catch(e) {}
       });
@@ -461,36 +465,36 @@ const XHR_PAGE_HOOK = `(function() {
   if (origFetch) {
     window.fetch = function(input, init) {
       var method = (init && init.method) || "GET";
-      var url = typeof input === "string" ? input : (input && input.url ? input.url : String(input));
+      var rawUrl = typeof input === "string" ? input : (input && input.url ? input.url : String(input));
+      var url; try { url = new URL(rawUrl, location.href).href; } catch(e) { url = rawUrl; }
       var timestamp = Date.now();
       var upperMethod = method.toUpperCase();
-      var isMutating = upperMethod !== "GET" && upperMethod !== "HEAD";
+      // Only intercept mutating methods — GET/HEAD bodies are captured by
+      // filterResponseData or the cache fallback, so skip them entirely
+      // to avoid cloning/reading every response on every page.
+      if (upperMethod === "GET" || upperMethod === "HEAD") {
+        return origFetch.apply(this, arguments);
+      }
       return origFetch.apply(this, arguments).then(function(response) {
         var cloned = response.clone();
-        function postBody(text) {
+        // Inline the body read so the caller's await/then cannot resolve
+        // (and navigate away) before we capture the body.
+        return cloned.text().then(function(text) {
           if (text && text.length > 0) {
-            window.postMessage({
-              __browserBridgeXhrBody: true,
-              method: upperMethod,
-              url: url,
-              timestamp: timestamp,
-              status: cloned.status,
-              response_body: text.length > MAX_BODY ? text.slice(0, MAX_BODY) : text,
-            }, "*");
+            var el = document.getElementById("__bb_data");
+            if (el) {
+              el.setAttribute("data-body", JSON.stringify({
+                method: upperMethod,
+                url: url,
+                timestamp: timestamp,
+                status: cloned.status,
+                response_body: text.length > MAX_BODY ? text.slice(0, MAX_BODY) : text,
+              }));
+              document.dispatchEvent(new Event("__bb_body"));
+            }
           }
-        }
-        if (isMutating) {
-          // Inline the body read for POST/PUT/DELETE/PATCH so the caller's
-          // await/then cannot resolve (and navigate away) before we capture.
-          return cloned.text().then(function(text) {
-            postBody(text);
-            return response;
-          }).catch(function() { return response; });
-        }
-        // GET/HEAD: detached read — filterResponseData or cache fallback handles these,
-        // so don't add latency to the caller's promise chain.
-        cloned.text().then(function(text) { postBody(text); }).catch(function() {});
-        return response;
+          return response;
+        }).catch(function() { return response; });
       });
     };
   }
@@ -499,20 +503,26 @@ const XHR_PAGE_HOOK = `(function() {
 // Content-script code: sets up the postMessage relay AND injects the page-world hook via <script> tag
 const XHR_HOOK_CODE = `
   (function() {
-    // --- Relay: content script context, bridges postMessage -> runtime.sendMessage ---
+    // --- Relay: content script context, bridges DOM attribute -> runtime.sendMessage ---
     if (!window.__browserBridgeXhrRelay) {
       window.__browserBridgeXhrRelay = true;
-      window.addEventListener("message", function(event) {
-        if (event.source !== window) return;
-        if (!event.data || !event.data.__browserBridgeXhrBody) return;
-        browser.runtime.sendMessage({
-          type: "xhr_body_relay",
-          method: event.data.method,
-          url: event.data.url,
-          timestamp: event.data.timestamp,
-          status: event.data.status,
-          response_body: event.data.response_body,
-        });
+      document.addEventListener("__bb_body", function() {
+        try {
+          var el = document.getElementById("__bb_data");
+          if (!el) return;
+          var raw = el.getAttribute("data-body");
+          if (!raw) return;
+          el.removeAttribute("data-body");
+          var data = JSON.parse(raw);
+          browser.runtime.sendMessage({
+            type: "xhr_body_relay",
+            method: data.method,
+            url: data.url,
+            timestamp: data.timestamp,
+            status: data.status,
+            response_body: data.response_body,
+          });
+        } catch(e) {}
       });
     }
 
@@ -537,34 +547,11 @@ async function injectXhrHook(tabId) {
   }
 }
 
-/**
- * Register/unregister the XHR/fetch hook as a persistent content script via
- * browser.contentScripts.register(). Unlike executeScript, registered scripts
- * have manifest-level timing guarantees — they run at document_start BEFORE
- * any page scripts, ensuring window.fetch is hooked before the page can
- * capture a reference to the original.
- */
-async function registerXhrHook() {
-  if (registeredXhrHook) return;
-  try {
-    registeredXhrHook = await browser.contentScripts.register({
-      js: [{ code: XHR_HOOK_CODE }],
-      matches: ["<all_urls>"],
-      runAt: "document_start",
-      allFrames: false,
-    });
-  } catch (err) {
-    console.warn("[BrowserBridge] Failed to register XHR hook content script:", err);
-  }
-}
-
-async function unregisterXhrHook() {
-  if (!registeredXhrHook) return;
-  try {
-    await registeredXhrHook.unregister();
-  } catch {}
-  registeredXhrHook = null;
-}
+// XHR/fetch hook is declared in manifest.json as a content_script with
+// run_at: "document_start" for the strongest timing guarantee. No dynamic
+// registration needed — it always runs on every page. The hook is lightweight
+// for GET/HEAD (passes through to original fetch with zero overhead) and only
+// adds inline body reading for mutating methods (POST/PUT/DELETE/PATCH).
 
 function correlateXhrBody(msg, tabId) {
   const { method, url, timestamp, status, response_body } = msg;
@@ -873,8 +860,16 @@ browser.webRequest.onBeforeRequest.addListener(
       cleanupEntry(key);
     }, PENDING_REQUEST_TIMEOUT_MS);
 
+    // Skip response body capture for URLs that are obviously binary assets.
+    // filterResponseData has significant per-request IPC overhead, so avoid it
+    // for resources we'd never decode anyway.
+    const SKIP_URL_EXTS = /\.(png|jpe?g|gif|webp|avif|ico|svg|woff2?|ttf|otf|eot|mp[34]|webm|ogg|wav|flac|pdf|zip|gz|br|wasm)(\?|$)/i;
+    if (SKIP_URL_EXTS.test(details.url)) {
+      entry._filterDone = true;
+    }
+
     // Set up response body capture via filterResponseData (Firefox-specific)
-    try {
+    if (!entry._filterDone) try {
       const filter = browser.webRequest.filterResponseData(details.requestId);
       const chunks = [];
       let totalSize = 0;
@@ -1232,17 +1227,8 @@ browser.runtime.onMessage.addListener((msg, sender, sendResponse) => {
             await injectConsoleCapture(tab.id);
           }
         }
-        // Register/unregister the persistent XHR/fetch hook content script
-        if (name === "network" && enabled) {
-          await registerXhrHook();
-          // Also inject into the current tab (already loaded, won't get the registered script)
-          const tab = await getTargetTab();
-          if (tab) {
-            await injectXhrHook(tab.id);
-          }
-        } else if (name === "network" && !enabled) {
-          await unregisterXhrHook();
-        }
+        // XHR/fetch hook is always active via manifest content_scripts —
+        // no dynamic registration needed
         sendResponse({ ok: true, capabilities: { ...capabilities } });
       }).catch((err) => {
         console.error("[BrowserBridge] Failed to save capability:", err);
@@ -1289,17 +1275,6 @@ loadCapabilities().then(async () => {
     }
   }
 
-  // Register persistent XHR/fetch hook content script for future navigations,
-  // and inject into the active tab (already loaded, won't get the registered script)
-  if (capabilities.network) {
-    await registerXhrHook();
-    try {
-      const tabs = await browser.tabs.query({ active: true, currentWindow: true });
-      if (tabs.length > 0) {
-        await injectXhrHook(tabs[0].id);
-      }
-    } catch {
-      // May fail on privileged pages — ignore
-    }
-  }
+  // XHR/fetch hook is always active via manifest content_scripts —
+  // no dynamic registration or injection needed on startup
 });
