@@ -28,6 +28,8 @@ const consoleInjectedTabs = new Set();
 
 // XHR/fetch hook injection tracking
 const xhrHookInjectedTabs = new Set();
+// Registered content script handle for the XHR/fetch hook (browser.contentScripts.register)
+let registeredXhrHook = null;
 // Buffer for XHR-captured bodies awaiting correlation with webRequest entries
 // Key: "tabId:method:url", Value: { response_body, timestamp }
 const xhrBodyBuffer = new Map();
@@ -535,6 +537,35 @@ async function injectXhrHook(tabId) {
   }
 }
 
+/**
+ * Register/unregister the XHR/fetch hook as a persistent content script via
+ * browser.contentScripts.register(). Unlike executeScript, registered scripts
+ * have manifest-level timing guarantees — they run at document_start BEFORE
+ * any page scripts, ensuring window.fetch is hooked before the page can
+ * capture a reference to the original.
+ */
+async function registerXhrHook() {
+  if (registeredXhrHook) return;
+  try {
+    registeredXhrHook = await browser.contentScripts.register({
+      js: [{ code: XHR_HOOK_CODE }],
+      matches: ["<all_urls>"],
+      runAt: "document_start",
+      allFrames: false,
+    });
+  } catch (err) {
+    console.warn("[BrowserBridge] Failed to register XHR hook content script:", err);
+  }
+}
+
+async function unregisterXhrHook() {
+  if (!registeredXhrHook) return;
+  try {
+    await registeredXhrHook.unregister();
+  } catch {}
+  registeredXhrHook = null;
+}
+
 function correlateXhrBody(msg, tabId) {
   const { method, url, timestamp, status, response_body } = msg;
   if (!response_body || !url) return;
@@ -978,12 +1009,10 @@ browser.tabs.onUpdated.addListener((tabId, changeInfo) => {
         setTimeout(() => injectConsoleCapture(tabId), 100);
       }
 
-      // Re-inject XHR hook eagerly if network capability is enabled
-      // No delay — executeScript with runAt:"document_start" handles timing,
-      // and delaying risks the page's scripts capturing window.fetch first.
-      if (capabilities.network) {
-        injectXhrHook(tabId);
-      }
+      // XHR/fetch hook is handled by the registered content script
+      // (registerXhrHook) which runs at document_start with manifest-level
+      // timing. No need for executeScript here — it would race with page
+      // scripts and lose.
     }
 
     // Clean up tracked WS connections for this tab on navigation
@@ -1203,12 +1232,16 @@ browser.runtime.onMessage.addListener((msg, sender, sendResponse) => {
             await injectConsoleCapture(tab.id);
           }
         }
-        // Eagerly inject XHR hook into the active tab when network toggled on
+        // Register/unregister the persistent XHR/fetch hook content script
         if (name === "network" && enabled) {
+          await registerXhrHook();
+          // Also inject into the current tab (already loaded, won't get the registered script)
           const tab = await getTargetTab();
           if (tab) {
             await injectXhrHook(tab.id);
           }
+        } else if (name === "network" && !enabled) {
+          await unregisterXhrHook();
         }
         sendResponse({ ok: true, capabilities: { ...capabilities } });
       }).catch((err) => {
@@ -1256,8 +1289,10 @@ loadCapabilities().then(async () => {
     }
   }
 
-  // Eagerly inject XHR hook into the active tab on startup
+  // Register persistent XHR/fetch hook content script for future navigations,
+  // and inject into the active tab (already loaded, won't get the registered script)
   if (capabilities.network) {
+    await registerXhrHook();
     try {
       const tabs = await browser.tabs.query({ active: true, currentWindow: true });
       if (tabs.length > 0) {
