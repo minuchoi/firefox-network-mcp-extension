@@ -229,7 +229,7 @@ The MCP server (`src/mcp_server/server.py`) launches two concurrent async tasks:
 The Firefox extension runs a persistent background script that:
 
 - Connects as a WebSocket client and auto-reconnects with exponential backoff on disconnection.
-- Passively captures all HTTP traffic using Firefox's `webRequest` API. Response bodies are captured via `filterResponseData` (primary) with two fallback mechanisms: cache-based re-fetch for GET requests, and page-level XHR/`fetch` hooking via `<script>` tag injection for POST responses where `filterResponseData` produces no data (a Firefox limitation with `connection: close` + gzip responses). Captured data is stored in in-memory ring buffers -- 500 requests per tab, up to 20 tabs.
+- Passively captures all HTTP traffic using Firefox's `webRequest` API. Response bodies are captured via `filterResponseData` (primary) with two fallback mechanisms: cache-based re-fetch for GET requests, and page-level XHR/`fetch` hooking via `<script>` tag injection for POST responses where `filterResponseData` produces no data. The fetch hook inlines body reading into the promise chain so the caller's `await fetch()` does not resolve until the body is captured, preventing navigation races from dropping response bodies. Captured data is stored in in-memory ring buffers -- 500 requests per tab, up to 20 tabs.
 - On demand, injects content scripts into the active tab to perform DOM queries, console log interception, and WebSocket frame capture.
 - Correlates requests and responses using UUID-based message IDs with asyncio Futures (5-second timeout on the server side).
 

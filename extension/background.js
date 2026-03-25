@@ -450,7 +450,10 @@ const XHR_PAGE_HOOK = `(function() {
       var timestamp = Date.now();
       return origFetch.apply(this, arguments).then(function(response) {
         var cloned = response.clone();
-        cloned.text().then(function(text) {
+        // Inline the body read into the promise chain so the caller's
+        // await/then cannot resolve (and navigate away) before we capture
+        // the body and post it to the content-script relay.
+        return cloned.text().then(function(text) {
           if (text && text.length > 0) {
             window.postMessage({
               __browserBridgeXhrBody: true,
@@ -461,8 +464,8 @@ const XHR_PAGE_HOOK = `(function() {
               response_body: text.length > MAX_BODY ? text.slice(0, MAX_BODY) : text,
             }, "*");
           }
-        }).catch(function() {});
-        return response;
+          return response;
+        }).catch(function() { return response; });
       });
     };
   }
@@ -949,8 +952,10 @@ browser.tabs.onUpdated.addListener((tabId, changeInfo) => {
     }
 
     // Re-inject XHR hook eagerly if network capability is enabled
+    // No delay — executeScript with runAt:"document_start" handles timing,
+    // and delaying risks the page's scripts capturing window.fetch first.
     if (capabilities.network) {
-      setTimeout(() => injectXhrHook(tabId), 100);
+      injectXhrHook(tabId);
     }
 
     // Clean up tracked WS connections for this tab on navigation
