@@ -6,7 +6,7 @@ import json
 from typing import Any
 
 from mcp.server import Server
-from mcp.types import TextContent, Tool
+from mcp.types import ImageContent, TextContent, Tool
 
 from .request_store import RequestStore, WsFrameStore
 from .ws_bridge import ConnectionManager
@@ -187,6 +187,47 @@ def register_tools(
                 },
             ),
             Tool(
+                name="get_screenshot",
+                description=(
+                    "Capture a screenshot of the current (monitored) tab. "
+                    "Returns a PNG by default, or JPEG to reduce size."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "format": {
+                            "type": "string",
+                            "enum": ["png", "jpeg"],
+                            "description": "Image format (default png)",
+                        },
+                        "quality": {
+                            "type": "integer",
+                            "description": "JPEG quality 0-100 (ignored for png, default 80)",
+                        },
+                    },
+                },
+            ),
+            Tool(
+                name="get_storage",
+                description=(
+                    "Get the current page's localStorage, sessionStorage, and "
+                    "cookies (including HttpOnly cookies). Useful for debugging "
+                    "auth/session state. Large values are truncated."
+                ),
+                inputSchema={"type": "object", "properties": {}},
+            ),
+            Tool(
+                name="get_capture_status",
+                description=(
+                    "Diagnose what the extension is actually capturing right now: "
+                    "connection state, monitored tab, capability toggles, whether "
+                    "the network/console/XHR hooks are present on the current tab "
+                    "(e.g. blocked by CSP), and buffer counts. Use this when a "
+                    "capture tool unexpectedly returns nothing."
+                ),
+                inputSchema={"type": "object", "properties": {}},
+            ),
+            Tool(
                 name="start_ws_capture",
                 description=(
                     "Start capturing WebSocket frames for connections matching "
@@ -247,9 +288,13 @@ def register_tools(
         ]
 
     @mcp.call_tool()
-    async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
+    async def call_tool(
+        name: str, arguments: dict[str, Any]
+    ) -> list[TextContent | ImageContent]:
         try:
             result = await _dispatch(name, arguments)
+            if isinstance(result, ImageContent):
+                return [result]
             return [TextContent(type="text", text=json.dumps(result, indent=2))]
         except ConnectionError as e:
             return [TextContent(
@@ -288,6 +333,12 @@ def register_tools(
                 return await _get_page_html(args)
             case "get_console_logs":
                 return await _get_console_logs(args)
+            case "get_screenshot":
+                return await _get_screenshot(args)
+            case "get_storage":
+                return await _get_storage(args)
+            case "get_capture_status":
+                return await _get_capture_status()
             case "start_ws_capture":
                 return await _start_ws_capture(args)
             case "stop_ws_capture":
@@ -375,6 +426,43 @@ def register_tools(
             "logs": resp.get("logs", []),
             "count": resp.get("count", 0),
         }
+
+    async def _get_screenshot(args: dict[str, Any]) -> Any:
+        params: dict[str, Any] = {}
+        if "format" in args:
+            params["format"] = args["format"]
+        if "quality" in args:
+            params["quality"] = args["quality"]
+        resp = await manager.send_request("get_screenshot", params)
+        if "error" in resp:
+            return _error_response("extension_error", resp["error"])
+        data = resp.get("data")
+        if not data:
+            return _error_response("extension_error", "No image data returned")
+        return ImageContent(
+            type="image",
+            data=data,
+            mimeType=resp.get("mimeType", "image/png"),
+        )
+
+    async def _get_storage(args: dict[str, Any]) -> dict[str, Any]:
+        resp = await manager.send_request("get_storage")
+        if "error" in resp:
+            return _error_response("extension_error", resp["error"])
+        resp.pop("msg_id", None)
+        return resp
+
+    async def _get_capture_status() -> dict[str, Any]:
+        resp = await manager.send_request("get_capture_status")
+        if "error" in resp:
+            return _error_response("extension_error", resp["error"])
+        resp.pop("msg_id", None)
+        # Fold in server-side store totals the extension does not know about.
+        resp["server_stores"] = {
+            "requests_stored": store.total_count,
+            "active_ws_captures": list(ws_store.active_captures),
+        }
+        return resp
 
     async def _start_ws_capture(args: dict[str, Any]) -> dict[str, Any]:
         url_pattern = _require_param(args, "url_pattern")

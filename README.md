@@ -25,6 +25,14 @@ Connects Firefox to Claude Code via the [Model Context Protocol](https://modelco
 | `get_page_info` | Get the active tab's URL, title, and tab ID |
 | `query_dom` | Query DOM elements by CSS selector (returns tag, text, attributes, outerHTML) |
 | `get_page_html` | Get full page HTML or a specific element's HTML (truncated at 500 KB) |
+| `get_screenshot` | Capture a PNG/JPEG screenshot of the monitored tab |
+| `get_storage` | Get localStorage, sessionStorage, and cookies (including HttpOnly) |
+
+**Diagnostics**
+
+| Tool | Description |
+|------|-------------|
+| `get_capture_status` | Report what the extension is actually capturing: connection, monitored tab, capability toggles, per-tab hook presence (e.g. CSP-blocked), and buffer counts |
 
 **Console**
 
@@ -114,7 +122,7 @@ Click the extension icon in the Firefox toolbar to open the control panel. From 
 | Toggle | Controls | MCP Tools Affected |
 |--------|----------|--------------------|
 | **Network Requests** | HTTP traffic capture and storage | `get_network_requests`, `get_request_details`, `search_network` |
-| **DOM / HTML** | Page queries and HTML access | `get_page_info`, `query_dom`, `get_page_html` |
+| **DOM / HTML** | Page queries, HTML, screenshots, storage | `get_page_info`, `query_dom`, `get_page_html`, `get_screenshot`, `get_storage` |
 | **Console Logs** | Console output capture | `get_console_logs` |
 | **WebSocket Frames** | WS message interception | `start_ws_capture`, `stop_ws_capture`, `get_ws_frames` |
 
@@ -193,6 +201,23 @@ Get recent console log entries from the current page.
 | `level` | string | no | Filter by level: log, warn, error, info, debug |
 | `limit` | integer | no | Max entries (default 100) |
 
+### get_screenshot
+
+Capture a screenshot of the monitored tab. Returns an image (PNG by default).
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `format` | string | no | "png" (default) or "jpeg" |
+| `quality` | integer | no | JPEG quality 0-100 (default 80; ignored for png) |
+
+### get_storage
+
+Get the current page's `localStorage`, `sessionStorage`, and cookies (including HttpOnly cookies, which `document.cookie` cannot see). Large values are truncated. No parameters.
+
+### get_capture_status
+
+Diagnose what the extension is capturing: connection state, monitored tab, capability toggles, whether the network/console/XHR hooks are actually present on the current tab (surfacing CSP-blocked injection), buffer counts, and server-side store totals. No parameters. Use this when a capture tool unexpectedly returns nothing.
+
 ### start_ws_capture
 
 Start capturing WebSocket frames for connections matching a URL pattern. Frames are not captured by default -- you must call this first.
@@ -223,7 +248,7 @@ Retrieve captured WebSocket frames.
 
 The MCP server (`src/mcp_server/server.py`) launches two concurrent async tasks:
 
-- **MCP stdio server** -- communicates with Claude Code over stdin/stdout using the MCP protocol. Exposes 10 tools.
+- **MCP stdio server** -- communicates with Claude Code over stdin/stdout using the MCP protocol. Exposes 13 tools.
 - **WebSocket server** -- listens on `ws://127.0.0.1:7865` for the Firefox extension to connect. Connections whose `Origin` is not a `moz-extension://` origin are rejected, so a web page cannot open the port and impersonate the extension.
 
 The Firefox extension runs a persistent background script that:

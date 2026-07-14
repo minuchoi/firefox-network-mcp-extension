@@ -10,6 +10,7 @@
     "tabs",
     "activeTab",
     "storage",
+    "cookies",
     "<all_urls>"
   ],
   "icons": {

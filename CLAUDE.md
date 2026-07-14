@@ -34,7 +34,7 @@ The MCP server is configured in `.mcp.json` to launch via `uv run`.
    - Capability state persisted via `browser.storage.local`
 
 2. **Python MCP Server** (`src/mcp_server/`) — Async server running two concurrent tasks:
-   - **MCP stdio server** — exposes 10 tools to Claude Code
+   - **MCP stdio server** — exposes 13 tools to Claude Code
    - **WebSocket server** (port 7865) — receives data from and sends commands to the extension
    - Both tasks run under `asyncio.wait(..., FIRST_COMPLETED)`. If the WS server fails at startup (e.g. port already bound) the error is surfaced immediately instead of silently running MCP with a dead bridge. SIGTERM/SIGINT set a shutdown event **and** cancel the MCP task (which otherwise blocks on stdin), so the process actually exits.
 
@@ -85,7 +85,7 @@ The MCP server is configured in `.mcp.json` to launch via `uv run`.
 ## Key Files
 
 - `src/mcp_server/server.py` — Entry point, wires up MCP + WebSocket servers
-- `src/mcp_server/tools.py` — All MCP tool definitions and dispatch logic (match/case)
+- `src/mcp_server/tools.py` — All MCP tool definitions and dispatch logic (match/case). Most tools return a dict serialized to `TextContent`; `get_screenshot` returns an `ImageContent` (base64 PNG/JPEG) which `call_tool` passes through directly. On-demand tools are gated in the extension by capability (`dom`/`console`), except `get_capture_status` which is intentionally ungated so diagnostics work when capture is off.
 - `src/mcp_server/ws_bridge.py` — WebSocket server, ConnectionManager, message routing
 - `src/mcp_server/request_store.py` — RequestStore and WsFrameStore ring buffers
 - `extension/background.js` — All extension logic (WS client, network capture, DOM tools, WS frame capture, capability toggles)

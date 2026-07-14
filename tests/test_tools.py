@@ -270,3 +270,93 @@ async def test_get_network_requests_limit_zero_clamped(mcp_env):
     store.add(make_request())
     result = await _call(mcp, "get_network_requests", {"limit": 0})
     assert result["returned"] == 1  # clamped to min 1
+
+
+# ─── get_screenshot ──────────────────────────────────────────────────────────
+
+
+async def _call_raw(mcp, name, arguments=None):
+    """Return the first content object (not JSON-parsed) for image results."""
+    handler = mcp.request_handlers[CallToolRequest]
+    req = CallToolRequest(
+        method="tools/call",
+        params=CallToolRequestParams(name=name, arguments=arguments or {}),
+    )
+    result = await handler(req)
+    return result.root.content[0]
+
+
+async def test_get_screenshot_returns_image(mcp_env):
+    mcp, _, _, manager = mcp_env
+    manager.send_request.return_value = {"data": "QUJD", "mimeType": "image/png"}
+    content = await _call_raw(mcp, "get_screenshot")
+    assert content.type == "image"
+    assert content.data == "QUJD"
+    assert content.mimeType == "image/png"
+
+
+async def test_get_screenshot_passes_format_and_quality(mcp_env):
+    mcp, _, _, manager = mcp_env
+    manager.send_request.return_value = {"data": "QUJD", "mimeType": "image/jpeg"}
+    await _call_raw(mcp, "get_screenshot", {"format": "jpeg", "quality": 60})
+    manager.send_request.assert_awaited_once_with(
+        "get_screenshot", {"format": "jpeg", "quality": 60}
+    )
+
+
+async def test_get_screenshot_extension_error(mcp_env):
+    mcp, _, _, manager = mcp_env
+    manager.send_request.return_value = {"error": "No active tab"}
+    result = await _call(mcp, "get_screenshot")
+    assert result["error"]["code"] == "extension_error"
+
+
+async def test_get_screenshot_missing_data(mcp_env):
+    mcp, _, _, manager = mcp_env
+    manager.send_request.return_value = {"mimeType": "image/png"}
+    result = await _call(mcp, "get_screenshot")
+    assert result["error"]["code"] == "extension_error"
+
+
+# ─── get_storage ─────────────────────────────────────────────────────────────
+
+
+async def test_get_storage_delegates_and_strips_msg_id(mcp_env):
+    mcp, _, _, manager = mcp_env
+    manager.send_request.return_value = {
+        "msg_id": "abc123",
+        "url": "https://example.com",
+        "local_storage": {"token": "xyz"},
+        "cookies": [{"name": "sid", "value": "1"}],
+    }
+    result = await _call(mcp, "get_storage")
+    assert "msg_id" not in result
+    assert result["local_storage"] == {"token": "xyz"}
+    assert result["cookies"] == [{"name": "sid", "value": "1"}]
+
+
+async def test_get_storage_extension_error(mcp_env):
+    mcp, _, _, manager = mcp_env
+    manager.send_request.return_value = {"error": "No active tab"}
+    result = await _call(mcp, "get_storage")
+    assert result["error"]["code"] == "extension_error"
+
+
+# ─── get_capture_status ──────────────────────────────────────────────────────
+
+
+async def test_get_capture_status_folds_in_server_stores(mcp_env):
+    mcp, store, ws_store, manager = mcp_env
+    store.add(make_request())
+    ws_store.start_capture("wss://x.*")
+    manager.send_request.return_value = {
+        "msg_id": "id1",
+        "connected": True,
+        "monitored_tab_id": 7,
+        "warnings": [],
+    }
+    result = await _call(mcp, "get_capture_status")
+    assert "msg_id" not in result
+    assert result["monitored_tab_id"] == 7
+    assert result["server_stores"]["requests_stored"] == 1
+    assert "wss://x.*" in result["server_stores"]["active_ws_captures"]

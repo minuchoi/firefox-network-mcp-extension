@@ -203,6 +203,24 @@ async function handleServerMessage(raw) {
         }
         response = await handleGetConsoleLogs(msg);
         break;
+      case "get_screenshot":
+        if (!capabilities.dom) {
+          response = { error: "Capability disabled by user: dom" };
+          break;
+        }
+        response = await handleGetScreenshot(msg);
+        break;
+      case "get_storage":
+        if (!capabilities.dom) {
+          response = { error: "Capability disabled by user: dom" };
+          break;
+        }
+        response = await handleGetStorage(msg);
+        break;
+      case "get_capture_status":
+        // Intentionally ungated: diagnostics must work even when capture is off.
+        response = await handleGetCaptureStatus();
+        break;
       case "start_ws_capture":
         if (!capabilities.websocket) {
           response = { error: "Capability disabled by user: websocket" };
@@ -431,6 +449,153 @@ async function handleGetConsoleLogs(msg) {
   } catch (err) {
     return { error: err.message };
   }
+}
+
+// ─── Screenshot ──────────────────────────────────────────────────────────────
+
+async function handleGetScreenshot(msg) {
+  const tab = await getTargetTab();
+  if (!tab) return { error: "No active tab" };
+
+  const format = msg.format === "jpeg" ? "jpeg" : "png";
+  const options = { format };
+  if (format === "jpeg") {
+    const q = Number(msg.quality);
+    options.quality = Number.isFinite(q) ? Math.max(0, Math.min(100, q)) : 80;
+  }
+
+  try {
+    // captureTab (Firefox 82+) grabs a specific tab regardless of which tab is
+    // active; fall back to the active tab of the window otherwise.
+    const dataUrl = browser.tabs.captureTab
+      ? await browser.tabs.captureTab(tab.id, options)
+      : await browser.tabs.captureVisibleTab(tab.windowId, options);
+    const comma = dataUrl.indexOf(",");
+    return {
+      data: comma >= 0 ? dataUrl.slice(comma + 1) : dataUrl,
+      mimeType: format === "jpeg" ? "image/jpeg" : "image/png",
+    };
+  } catch (err) {
+    return { error: err.message };
+  }
+}
+
+// ─── Storage / Cookies ───────────────────────────────────────────────────────
+
+async function handleGetStorage(msg) {
+  const tab = await getTargetTab();
+  if (!tab) return { error: "No active tab" };
+
+  const MAX_VALUE = 10000; // truncate large values to keep the payload sane
+  const result = { url: tab.url };
+
+  // localStorage / sessionStorage: content scripts share the page origin, so
+  // window.localStorage here IS the page's storage (no page-world injection).
+  const readCode = `
+    (function() {
+      var MAX = ${MAX_VALUE};
+      function dump(s) {
+        var out = {};
+        try {
+          for (var i = 0; i < s.length; i++) {
+            var k = s.key(i);
+            var v = s.getItem(k);
+            out[k] = (v != null && v.length > MAX) ? v.slice(0, MAX) + "\\u2026[truncated]" : v;
+          }
+        } catch(e) { return { __error: String(e) }; }
+        return out;
+      }
+      return { local: dump(window.localStorage), session: dump(window.sessionStorage) };
+    })();
+  `;
+  try {
+    const results = await browser.tabs.executeScript(tab.id, { code: readCode });
+    if (results && results[0]) {
+      result.local_storage = results[0].local;
+      result.session_storage = results[0].session;
+    }
+  } catch (err) {
+    result.storage_error = err.message;
+  }
+
+  // Cookies via the cookies API — includes HttpOnly cookies that document.cookie
+  // cannot see (the common case for session/auth debugging).
+  try {
+    const cookies = await browser.cookies.getAll({ url: tab.url });
+    result.cookies = cookies.map((c) => ({
+      name: c.name,
+      value: c.value.length > MAX_VALUE ? c.value.slice(0, MAX_VALUE) + "…[truncated]" : c.value,
+      domain: c.domain,
+      path: c.path,
+      secure: c.secure,
+      httpOnly: c.httpOnly,
+      sameSite: c.sameSite,
+      session: c.session,
+      expirationDate: c.expirationDate || null,
+    }));
+  } catch (err) {
+    result.cookies_error = err.message;
+  }
+
+  return result;
+}
+
+// ─── Capture Diagnostics ──────────────────────────────────────────────────────
+
+async function handleGetCaptureStatus() {
+  const status = {
+    connected: isConnected(),
+    monitored_tab_id: monitoredTabId,
+    capabilities: { ...capabilities },
+    web_request_listeners_active: webRequestListenersActive,
+    xhr_hook_registered: xhrHookRegistration !== null,
+    tracked_ws_connections: trackedWsConnections.size,
+    ws_capturing_patterns: [...wsCapturingPatterns],
+    pending_requests: pendingRequests.size,
+    console_injected_tabs: consoleInjectedTabs.size,
+  };
+
+  const warnings = [];
+  if (monitoredTabId === null) {
+    warnings.push("No tab is monitored; network and console capture are inactive until a tab is selected.");
+  }
+
+  const tab = await getTargetTab();
+  if (tab) {
+    status.tab = { id: tab.id, url: tab.url, title: tab.title };
+    try {
+      const results = await browser.tabs.executeScript(tab.id, { code: `
+        (function() {
+          var page = window.wrappedJSObject;
+          return {
+            xhr_relay_present: !!window.__browserBridgeXhrRelay,
+            xhr_page_hook_present: !!(page && page.__browserBridgeXhrCapture),
+            console_hook_present: !!(page && page.__browserBridgeConsoleLogs),
+            ws_capture_present: !!(page && page.__browserBridgeWsCapture),
+          };
+        })();
+      ` });
+      status.tab_hooks = (results && results[0]) || null;
+    } catch (err) {
+      status.tab_hooks = { error: err.message };
+    }
+
+    const h = status.tab_hooks;
+    if (h && !h.error) {
+      if (capabilities.network && h.xhr_relay_present && !h.xhr_page_hook_present) {
+        warnings.push("XHR/fetch page-world hook not present despite network capture on. The page's Content-Security-Policy may block inline <script> injection; filterResponseData still works as primary body capture.");
+      }
+      if (capabilities.console && !h.console_hook_present) {
+        warnings.push("Console hook not present on this tab. It injects on toggle-on, navigation, or first get_console_logs, and a strict CSP can block it.");
+      }
+    }
+    if (tab.id !== monitoredTabId && monitoredTabId !== null) {
+      warnings.push("Target tab differs from the monitored tab.");
+    }
+  }
+
+  status.warnings = warnings;
+  return status;
 }
 
 // ─── XHR/Fetch Response Body Capture ────────────────────────────────────────
