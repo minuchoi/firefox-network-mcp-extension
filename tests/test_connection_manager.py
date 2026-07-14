@@ -240,3 +240,38 @@ async def test_send_request_cleaned_up_on_send_failure(manager, mock_ws):
         await manager.send_request("test_action")
 
     assert len(manager._pending) == 0
+
+
+async def test_register_replace_fails_pending_futures(manager, mock_ws):
+    """Replacing a connection must fail in-flight requests immediately, not
+    leave them to time out."""
+    await manager.register(mock_ws)
+
+    async def slow_request():
+        return await manager.send_request("query_dom", {"selector": "body"})
+
+    task = asyncio.create_task(slow_request())
+    await asyncio.sleep(0)  # let the request register its future
+
+    new_ws = AsyncMock()
+    new_ws.close = AsyncMock()
+    await manager.register(new_ws)
+
+    with pytest.raises(ConnectionError):
+        await asyncio.wait_for(task, timeout=1.0)
+
+
+async def test_handle_message_ignores_non_object_json(manager, mock_ws):
+    await manager.register(mock_ws)
+    # A valid-JSON array/scalar must not raise (would kill the connection).
+    await manager.handle_message("[1, 2, 3]")
+    await manager.handle_message("42")
+    assert manager.connected is True
+
+
+async def test_xhr_body_patch_null_method_no_crash(manager, mock_ws):
+    await manager.register(mock_ws)
+    await manager.handle_message(
+        json.dumps({"type": "xhr_body_patch", "method": None, "url": "u", "response_body": "b"})
+    )
+    assert manager.connected is True

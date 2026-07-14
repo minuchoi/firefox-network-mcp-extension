@@ -21,7 +21,16 @@ MAX_REGEX_CACHE_SIZE = 100
 _regex_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
 
 
+def _cache_set(pattern: str, value: re.Pattern[str] | None) -> None:
+    """Insert into the regex cache with LRU eviction. Covers None entries too,
+    so repeated invalid/slow patterns cannot grow the cache without bound."""
+    if pattern not in _REGEX_CACHE and len(_REGEX_CACHE) >= MAX_REGEX_CACHE_SIZE:
+        _REGEX_CACHE.popitem(last=False)  # evict oldest
+    _REGEX_CACHE[pattern] = value
+
+
 def _safe_regex_search(pattern: str, text: str) -> bool:
+    global _regex_executor
     if len(pattern) > MAX_REGEX_PATTERN_LENGTH:
         logger.warning("Regex pattern too long (%d chars), rejecting", len(pattern))
         return False
@@ -31,11 +40,9 @@ def _safe_regex_search(pattern: str, text: str) -> bool:
             compiled = re.compile(pattern, re.IGNORECASE)
         except re.error as exc:
             logger.warning("Invalid regex pattern %r: %s", pattern, exc)
-            _REGEX_CACHE[pattern] = None
+            _cache_set(pattern, None)
             return False
-        if len(_REGEX_CACHE) >= MAX_REGEX_CACHE_SIZE:
-            _REGEX_CACHE.popitem(last=False)  # evict oldest (LRU)
-        _REGEX_CACHE[pattern] = compiled
+        _cache_set(pattern, compiled)
     elif compiled is not None:
         _REGEX_CACHE.move_to_end(pattern)  # mark as recently used
     if compiled is None:
@@ -46,7 +53,13 @@ def _safe_regex_search(pattern: str, text: str) -> bool:
         return result is not None
     except (concurrent.futures.TimeoutError, RecursionError) as exc:
         logger.warning("Regex pattern %r failed (%s), evicting from cache", pattern, exc)
-        _REGEX_CACHE[pattern] = None
+        _cache_set(pattern, None)
+        # The worker thread cannot be interrupted and is now stuck on a runaway
+        # match. Abandon this executor and start a fresh one so later searches
+        # are not queued behind the stuck job (which would poison every
+        # subsequent search for the process lifetime).
+        _regex_executor.shutdown(wait=False)
+        _regex_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
         return False
 
 
@@ -146,8 +159,9 @@ class RequestStore:
     ) -> None:
         self._max_per_tab = max_per_tab
         self._max_tabs = max_tabs
-        # tab_id -> deque of request_ids (insertion order)
-        self._tabs: dict[int, deque[str]] = {}
+        # tab_id -> deque of request_ids. Ordered least-recently-active first so
+        # over-cap eviction drops an idle tab, not the busy/monitored one.
+        self._tabs: OrderedDict[int, deque[str]] = OrderedDict()
         # request_id -> NetworkRequest
         self._requests: dict[str, NetworkRequest] = {}
 
@@ -169,9 +183,10 @@ class RequestStore:
             evicted_id = tab_q.popleft()
             self._requests.pop(evicted_id, None)
         tab_q.append(req.request_id)
+        self._tabs.move_to_end(req.tab_id)  # mark tab as most-recently-active
         self._requests[req.request_id] = req
 
-        # Evict oldest tab if too many
+        # Evict least-recently-active tab if too many
         if len(self._tabs) > self._max_tabs:
             oldest_tab = next(iter(self._tabs))
             for rid in self._tabs.pop(oldest_tab):
@@ -239,10 +254,13 @@ class RequestStore:
 class WsFrameStore:
     """Ring buffer for captured WebSocket frames, keyed by connection URL."""
 
-    def __init__(self, max_per_connection: int = 500) -> None:
+    def __init__(
+        self, max_per_connection: int = 500, max_connections: int = 50
+    ) -> None:
         self._max = max_per_connection
-        # connection_url -> deque of WsFrame
-        self._frames: dict[str, deque[WsFrame]] = {}
+        self._max_connections = max_connections
+        # connection_url -> deque of WsFrame (insertion-ordered for URL eviction)
+        self._frames: OrderedDict[str, deque[WsFrame]] = OrderedDict()
         # URLs currently being captured
         self._active_captures: set[str] = set()
 
@@ -256,7 +274,14 @@ class WsFrameStore:
         )
         if not matched:
             return
-        q = self._frames.setdefault(frame.connection_url, deque())
+        q = self._frames.get(frame.connection_url)
+        if q is None:
+            # Cap the number of distinct connection URLs (URLs often embed
+            # unique session tokens, so this set would otherwise grow forever).
+            if len(self._frames) >= self._max_connections:
+                self._frames.popitem(last=False)  # evict oldest connection
+            q = deque()
+            self._frames[frame.connection_url] = q
         if len(q) >= self._max:
             q.popleft()
         q.append(frame)
@@ -269,25 +294,28 @@ class WsFrameStore:
         tab_id: int | None = None,
         limit: int = 100,
     ) -> list[dict[str, Any]]:
-        results: list[dict[str, Any]] = []
+        matched: list[WsFrame] = []
         for conn_url, frames in self._frames.items():
             if url_pattern and not _safe_regex_search(url_pattern, conn_url):
                 continue
-            for frame in reversed(frames):
+            for frame in frames:
                 if direction and frame.direction != direction:
                     continue
                 if tab_id is not None and frame.tab_id != tab_id:
                     continue
-                results.append({
-                    "connection_url": frame.connection_url,
-                    "direction": frame.direction,
-                    "data": frame.data,
-                    "timestamp": frame.timestamp,
-                    "tab_id": frame.tab_id,
-                })
-                if len(results) >= limit:
-                    return results
-        return results
+                matched.append(frame)
+        # Globally newest-first across all connections before applying the limit
+        matched.sort(key=lambda f: f.timestamp, reverse=True)
+        return [
+            {
+                "connection_url": frame.connection_url,
+                "direction": frame.direction,
+                "data": frame.data,
+                "timestamp": frame.timestamp,
+                "tab_id": frame.tab_id,
+            }
+            for frame in matched[:limit]
+        ]
 
     def start_capture(self, url_pattern: str) -> None:
         self._active_captures.add(url_pattern)

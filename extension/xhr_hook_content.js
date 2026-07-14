@@ -67,6 +67,9 @@
         var um = meta && meta.method.toUpperCase();
         if (meta && um !== "GET" && um !== "HEAD") {
           var xhr = this;
+          // { once: true }: a reused XHR (open/send called again) must not keep
+          // stale load listeners that would report a later response under an
+          // earlier request's URL, and must not accumulate on polling XHRs.
           xhr.addEventListener("load", function() {
             try {
               // Extract body based on responseType — responseText throws for
@@ -87,7 +90,7 @@
                 var el = document.getElementById("__bb_data");
                 if (el) {
                   el.setAttribute("data-body", JSON.stringify({
-                    method: meta.method,
+                    method: um,
                     url: meta.url,
                     timestamp: meta.timestamp,
                     status: xhr.status,
@@ -97,7 +100,7 @@
                 }
               }
             } catch(e) {}
-          });
+          }, { once: true });
         }
         return origSend.apply(this, arguments);
       };
@@ -105,7 +108,10 @@
       var origFetch = window.fetch;
       if (origFetch) {
         window.fetch = function(input, init) {
-          var method = (init && init.method) || "GET";
+          // Method can come from init OR from a Request object passed as input
+          // (e.g. fetch(new Request(url, {method:"POST"}))). Check both.
+          var method = (init && init.method) ||
+            (input && typeof input === "object" && input.method) || "GET";
           var rawUrl = typeof input === "string" ? input : (input && input.url ? input.url : String(input));
           var url;
           try { url = new URL(rawUrl, location.href).href; } catch(e) { url = rawUrl; }

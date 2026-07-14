@@ -116,3 +116,30 @@ class TestCaptures:
         captures = ws_frame_store.active_captures
         captures.add("wss://injected.com/*")
         assert "wss://injected.com/*" not in ws_frame_store.active_captures
+
+
+class TestConnectionCap:
+    def test_connection_url_count_is_capped(self):
+        from mcp_server.request_store import WsFrameStore
+
+        store = WsFrameStore(max_per_connection=5, max_connections=3)
+        store.start_capture(".*")
+        for i in range(5):
+            store.add(make_ws_frame(connection_url=f"wss://host/{i}", data="x"))
+        # Only the 3 most-recent connection URLs are retained
+        urls = {r["connection_url"] for r in store.get_frames(limit=100)}
+        assert urls == {"wss://host/2", "wss://host/3", "wss://host/4"}
+
+
+class TestGlobalOrdering:
+    def test_get_frames_newest_first_across_connections(self, ws_frame_store):
+        # Older connection A, then newer connection B with the latest frame
+        ws_frame_store.add(
+            make_ws_frame(connection_url="wss://a", data="old", timestamp=100.0)
+        )
+        ws_frame_store.add(
+            make_ws_frame(connection_url="wss://b", data="new", timestamp=200.0)
+        )
+        results = ws_frame_store.get_frames(limit=1)
+        assert len(results) == 1
+        assert results[0]["data"] == "new"  # newest wins regardless of connection

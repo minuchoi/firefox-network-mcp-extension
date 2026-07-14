@@ -26,10 +26,10 @@ const wsCapturingPatterns = new Set();
 // Console log injection tracking
 const consoleInjectedTabs = new Set();
 
-// XHR/fetch hook injection tracking
-const xhrHookInjectedTabs = new Set();
 // Dynamic content script registration handle (browser.contentScripts.register)
 let xhrHookRegistration = null;
+// Guards against concurrent registerXhrHookContentScript() calls double-registering
+let xhrHookRegistering = false;
 // Whether webRequest listeners are currently registered
 let webRequestListenersActive = false;
 // Buffer for XHR-captured bodies awaiting correlation with webRequest entries
@@ -41,7 +41,10 @@ const XHR_BODY_BUFFER_MAX = 500;
 let monitoredTabId = null;
 
 function isTabMonitored(tabId) {
-  return monitoredTabId === null || monitoredTabId === tabId;
+  // Only the explicitly selected tab is monitored. A null id means "none"
+  // (e.g. immediately after the monitored tab was closed), never "all tabs" —
+  // the latter would reintroduce the browser-wide capture slowdown.
+  return monitoredTabId !== null && monitoredTabId === tabId;
 }
 
 function pendingKey(tabId, requestId) {
@@ -327,32 +330,47 @@ async function handleGetPageHtml(msg) {
 
 // ─── Console Logs ────────────────────────────────────────────────────────────
 
+// Content scripts run in an isolated compartment, so overriding `console` here
+// would NOT intercept the page's own console.* calls (Firefox Xray isolation —
+// the same reason the XHR hook must run page-world). Inject the override via a
+// <script> tag so it runs in the page world and stores logs on the page window;
+// the read path pulls them back via window.wrappedJSObject.
 const CONSOLE_INJECT_CODE = `
   (function() {
-    if (window.__browserBridgeConsoleLogs) return;
-    window.__browserBridgeConsoleLogs = [];
-    const MAX_LOGS = 500;
-    const levels = ["log", "warn", "error", "info", "debug"];
-    for (const level of levels) {
-      const original = console[level].bind(console);
-      console[level] = function(...args) {
-        const entry = {
-          level,
-          timestamp: Date.now(),
-          args: args.map(function(a) {
-            try {
-              return typeof a === "object" ? JSON.stringify(a).slice(0, 1000) : String(a).slice(0, 1000);
-            } catch(e) {
-              return String(a).slice(0, 1000);
-            }
-          }),
+    if (window.__bbConsoleInjected) return;
+    window.__bbConsoleInjected = true;
+    var s = document.createElement("script");
+    s.textContent = '(' + function() {
+      if (window.__browserBridgeConsoleLogs) return;
+      window.__browserBridgeConsoleLogs = [];
+      var MAX_LOGS = 500;
+      var levels = ["log", "warn", "error", "info", "debug"];
+      levels.forEach(function(level) {
+        var original = console[level].bind(console);
+        console[level] = function() {
+          var args = Array.prototype.slice.call(arguments);
+          try {
+            var entry = {
+              level: level,
+              timestamp: Date.now(),
+              args: args.map(function(a) {
+                try {
+                  return typeof a === "object" ? JSON.stringify(a).slice(0, 1000) : String(a).slice(0, 1000);
+                } catch(e) {
+                  return String(a).slice(0, 1000);
+                }
+              }),
+            };
+            var logs = window.__browserBridgeConsoleLogs;
+            logs.push(entry);
+            if (logs.length > MAX_LOGS) logs.shift();
+          } catch(e) {}
+          return original.apply(console, args);
         };
-        const logs = window.__browserBridgeConsoleLogs;
-        logs.push(entry);
-        if (logs.length > MAX_LOGS) logs.shift();
-        original.apply(console, args);
-      };
-    }
+      });
+    } + ')();';
+    (document.documentElement || document).appendChild(s);
+    s.remove();
   })();
 `;
 
@@ -386,12 +404,23 @@ async function handleGetConsoleLogs(msg) {
   const limit = msg.limit || 100;
   const readCode = `
     (function() {
-      const logs = window.__browserBridgeConsoleLogs || [];
-      const level = ${JSON.stringify(level)};
-      const limit = ${JSON.stringify(limit)};
-      let filtered = level ? logs.filter(function(l) { return l.level === level; }) : logs;
-      filtered = filtered.slice(-limit);
-      return { logs: filtered, count: filtered.length };
+      // Logs live on the page world; read them through wrappedJSObject and copy
+      // primitives out so the returned value is a clean content-script object.
+      var page = window.wrappedJSObject;
+      var raw = page ? page.__browserBridgeConsoleLogs : window.__browserBridgeConsoleLogs;
+      if (!raw) return { logs: [], count: 0 };
+      var level = ${JSON.stringify(level)};
+      var limit = ${JSON.stringify(limit)};
+      var out = [];
+      for (var i = 0; i < raw.length; i++) {
+        var l = raw[i];
+        if (level && String(l.level) !== level) continue;
+        var args = [];
+        for (var j = 0; j < l.args.length; j++) args.push(String(l.args[j]));
+        out.push({ level: String(l.level), timestamp: Number(l.timestamp), args: args });
+      }
+      if (out.length > limit) out = out.slice(out.length - limit);
+      return { logs: out, count: out.length };
     })();
   `;
 
@@ -406,151 +435,8 @@ async function handleGetConsoleLogs(msg) {
 
 // ─── XHR/Fetch Response Body Capture ────────────────────────────────────────
 
-// Page-world script injected via <script> tag to hook XHR/fetch prototypes.
-// Must run in the actual page context (not content script) to intercept page XHR calls.
-const XHR_PAGE_HOOK = `(function() {
-  if (window.__browserBridgeXhrCapture) return;
-  window.__browserBridgeXhrCapture = true;
-
-  var MAX_BODY = 1048576;
-  var XHR = XMLHttpRequest.prototype;
-  var origOpen = XHR.open;
-  var origSend = XHR.send;
-  var xhrMeta = new WeakMap();
-
-  XHR.open = function(method, url) {
-    var resolvedUrl; try { resolvedUrl = new URL(typeof url === "string" ? url : String(url), location.href).href; } catch(e) { resolvedUrl = typeof url === "string" ? url : String(url); }
-    xhrMeta.set(this, { method: method, url: resolvedUrl, timestamp: Date.now() });
-    return origOpen.apply(this, arguments);
-  };
-
-  XHR.send = function() {
-    var meta = xhrMeta.get(this);
-    // Only intercept mutating methods — GET/HEAD are handled by filterResponseData
-    var um = meta && meta.method.toUpperCase();
-    if (meta && um !== "GET" && um !== "HEAD") {
-      var xhr = this;
-      xhr.addEventListener("load", function() {
-        try {
-          // Extract body based on responseType — responseText throws for
-          // non-"" / non-"text" types (arraybuffer, blob, document, json)
-          var body;
-          var rt = xhr.responseType;
-          if (!rt || rt === "" || rt === "text") {
-            body = xhr.responseText;
-          } else if (rt === "json") {
-            body = xhr.response != null ? JSON.stringify(xhr.response) : null;
-          } else if (rt === "document") {
-            body = xhr.response ? new XMLSerializer().serializeToString(xhr.response) : null;
-          } else {
-            // arraybuffer, blob — skip, not text-representable
-            body = null;
-          }
-          if (body && body.length > 0) {
-            var el = document.getElementById("__bb_data");
-            if (el) {
-              el.setAttribute("data-body", JSON.stringify({
-                method: meta.method,
-                url: meta.url,
-                timestamp: meta.timestamp,
-                status: xhr.status,
-                response_body: body.length > MAX_BODY ? body.slice(0, MAX_BODY) : body,
-              }));
-              document.dispatchEvent(new Event("__bb_body"));
-            }
-          }
-        } catch(e) {}
-      });
-    }
-    return origSend.apply(this, arguments);
-  };
-
-  var origFetch = window.fetch;
-  if (origFetch) {
-    window.fetch = function(input, init) {
-      var method = (init && init.method) || "GET";
-      var rawUrl = typeof input === "string" ? input : (input && input.url ? input.url : String(input));
-      var url; try { url = new URL(rawUrl, location.href).href; } catch(e) { url = rawUrl; }
-      var timestamp = Date.now();
-      var upperMethod = method.toUpperCase();
-      // Only intercept mutating methods — GET/HEAD bodies are captured by
-      // filterResponseData or the cache fallback, so skip them entirely
-      // to avoid cloning/reading every response on every page.
-      if (upperMethod === "GET" || upperMethod === "HEAD") {
-        return origFetch.apply(this, arguments);
-      }
-      return origFetch.apply(this, arguments).then(function(response) {
-        var cloned = response.clone();
-        // Inline the body read so the caller's await/then cannot resolve
-        // (and navigate away) before we capture the body.
-        return cloned.text().then(function(text) {
-          if (text && text.length > 0) {
-            var el = document.getElementById("__bb_data");
-            if (el) {
-              el.setAttribute("data-body", JSON.stringify({
-                method: upperMethod,
-                url: url,
-                timestamp: timestamp,
-                status: cloned.status,
-                response_body: text.length > MAX_BODY ? text.slice(0, MAX_BODY) : text,
-              }));
-              document.dispatchEvent(new Event("__bb_body"));
-            }
-          }
-          return response;
-        }).catch(function() { return response; });
-      });
-    };
-  }
-})();`;
-
-// Content-script code: sets up the postMessage relay AND injects the page-world hook via <script> tag
-const XHR_HOOK_CODE = `
-  (function() {
-    // --- Relay: content script context, bridges DOM attribute -> runtime.sendMessage ---
-    if (!window.__browserBridgeXhrRelay) {
-      window.__browserBridgeXhrRelay = true;
-      document.addEventListener("__bb_body", function() {
-        try {
-          var el = document.getElementById("__bb_data");
-          if (!el) return;
-          var raw = el.getAttribute("data-body");
-          if (!raw) return;
-          el.removeAttribute("data-body");
-          var data = JSON.parse(raw);
-          browser.runtime.sendMessage({
-            type: "xhr_body_relay",
-            method: data.method,
-            url: data.url,
-            timestamp: data.timestamp,
-            status: data.status,
-            response_body: data.response_body,
-          });
-        } catch(e) {}
-      });
-    }
-
-    // --- Inject page-world hook via <script> tag ---
-    if (!document.getElementById("__browserBridgeXhrHook")) {
-      var s = document.createElement("script");
-      s.id = "__browserBridgeXhrHook";
-      s.textContent = ${JSON.stringify(XHR_PAGE_HOOK)};
-      (document.documentElement || document).appendChild(s);
-      s.remove();
-    }
-  })();
-`;
-
-async function injectXhrHook(tabId) {
-  if (xhrHookInjectedTabs.has(tabId)) return;
-  try {
-    await browser.tabs.executeScript(tabId, { code: XHR_HOOK_CODE, runAt: "document_start" });
-    xhrHookInjectedTabs.add(tabId);
-  } catch {
-    // Tab may not be ready yet or is a privileged page — silently ignore
-  }
-}
-
+// The page-world XHR/fetch hook lives in xhr_hook_content.js. The code below
+// only correlates the bodies it relays back with webRequest entries.
 // XHR/fetch hook is registered dynamically via browser.contentScripts.register()
 // when network capability is enabled, and unregistered when disabled. This avoids
 // wrapping XHR/fetch on every page when network capture is off. The hook runs at
@@ -624,6 +510,7 @@ async function decodeResponseBody(chunks, pending) {
       null; // brotli ("br") is not supported by DecompressionStream
 
     if (decompressFormat) {
+      const decompressedChunks = [];
       let writer = null;
       let reader = null;
       try {
@@ -633,7 +520,6 @@ async function decodeResponseBody(chunks, pending) {
 
         const writePromise = writer.write(combined).then(() => writer.close());
         writer = null; // writer.close() handles cleanup on success
-        const decompressedChunks = [];
         let readDone = false;
         while (!readDone) {
           const { value, done } = await reader.read();
@@ -645,7 +531,16 @@ async function decodeResponseBody(chunks, pending) {
         }
         reader = null; // successfully consumed
         await writePromise;
+      } catch (err) {
+        console.debug("[BrowserBridge] Decompression failed for", pending.url, normalizedEncoding, err.message);
+        // A body truncated at MAX_BODY_SIZE is an incomplete compressed stream:
+        // it decompresses partially, then throws. Keep the partial output below.
+      } finally {
+        try { if (writer) writer.close(); } catch {}
+        try { if (reader) reader.cancel(); } catch {}
+      }
 
+      if (decompressedChunks.length > 0) {
         const decompressedLen = decompressedChunks.reduce((acc, c) => acc + c.length, 0);
         bytes = new Uint8Array(decompressedLen);
         let dOffset = 0;
@@ -653,13 +548,14 @@ async function decodeResponseBody(chunks, pending) {
           bytes.set(chunk, dOffset);
           dOffset += chunk.length;
         }
-      } catch (err) {
-        console.debug("[BrowserBridge] Decompression failed for", pending.url, normalizedEncoding, err.message);
-        // Fall through and try decoding the raw bytes anyway
-      } finally {
-        try { if (writer) writer.close(); } catch {}
-        try { if (reader) reader.cancel(); } catch {}
+      } else if (pending.response_body_truncated) {
+        // Truncated compressed stream we could not decompress at all. Decoding
+        // the raw compressed bytes would emit garbage, so bail with a marker.
+        pending.response_body = "[truncated compressed response, not decoded]";
+        return;
       }
+      // else: bytes stays as the raw combined bytes and we fall through to the
+      // text decode (e.g. a mislabeled content-encoding that was not compressed).
     }
   }
 
@@ -801,14 +697,16 @@ function onBeforeRequestHandler(details) {
   // Track WebSocket upgrade requests regardless of network capability
   if (details.url.startsWith("ws://") || details.url.startsWith("wss://")) {
     if (capabilities.websocket) {
-      if (trackedWsConnections.size >= MAX_WS_CONNECTIONS) {
-        const firstKey = trackedWsConnections.keys().next().value;
-        trackedWsConnections.delete(firstKey);
-      }
       const tabIds = trackedWsConnections.get(details.url);
       if (tabIds) {
         tabIds.add(details.tabId);
       } else {
+        // Only evict when actually adding a new URL, so a reconnect to an
+        // already-tracked URL never drops an unrelated connection.
+        if (trackedWsConnections.size >= MAX_WS_CONNECTIONS) {
+          const firstKey = trackedWsConnections.keys().next().value;
+          trackedWsConnections.delete(firstKey);
+        }
         trackedWsConnections.set(details.url, new Set([details.tabId]));
       }
     }
@@ -863,11 +761,15 @@ function onBeforeRequestHandler(details) {
     cleanupEntry(oldestKey);
   }
 
+  // A redirect reuses the same requestId, so this key may already hold the
+  // previous hop. Clear it (and its timers) first so its stale filter/timer
+  // callbacks cannot corrupt this hop's entry.
+  if (pendingRequests.has(key)) cleanupEntry(key);
   pendingRequests.set(key, entry);
 
   // Hard timeout: evict orphaned entries that never complete
   entry._hardTimer = setTimeout(() => {
-    cleanupEntry(key);
+    if (pendingRequests.get(key) === entry) cleanupEntry(key);
   }, PENDING_REQUEST_TIMEOUT_MS);
 
   if (SKIP_URL_EXTS.test(details.url)) {
@@ -897,24 +799,22 @@ function onBeforeRequestHandler(details) {
     filter.onstop = () => {
       filter.close();
 
-      const pending = pendingRequests.get(key);
-      if (pending) {
-        pending.response_body_truncated = truncated;
-        // Store raw chunks — decoding happens in maybeSendEntry once headers are available
-        pending._rawChunks = chunks;
-        pending._filterDone = true;
-        maybeSendEntry(key);
-      }
+      // If a redirect hop replaced the entry under this shared key, this is a
+      // stale callback for a superseded hop — do not touch the newer entry.
+      if (pendingRequests.get(key) !== entry) return;
+      entry.response_body_truncated = truncated;
+      // Store raw chunks; decoding happens in maybeSendEntry once headers arrive
+      entry._rawChunks = chunks;
+      entry._filterDone = true;
+      maybeSendEntry(key);
     };
 
     filter.onerror = (event) => {
       console.warn("[BrowserBridge] Response filter error for", details.url, filter.error);
       try { filter.close(); } catch {}
-      const pending = pendingRequests.get(key);
-      if (pending) {
-        pending._filterDone = true;
-        maybeSendEntry(key);
-      }
+      if (pendingRequests.get(key) !== entry) return;
+      entry._filterDone = true;
+      maybeSendEntry(key);
     };
   } catch (err) {
     // filterResponseData not available (cached, service worker, etc.)
@@ -1020,17 +920,29 @@ function unregisterWebRequestListeners() {
 // ─── Dynamic XHR/fetch content script registration ───────────────────────────
 
 async function registerXhrHookContentScript() {
-  if (xhrHookRegistration) return;
+  // Guard on the in-flight flag too: contentScripts.register() is async, so two
+  // overlapping calls (e.g. startup + a rapid toggle) would both pass a bare
+  // `if (xhrHookRegistration)` check and double-register, leaking the first handle.
+  if (xhrHookRegistration || xhrHookRegistering) return;
+  xhrHookRegistering = true;
   try {
-    xhrHookRegistration = await browser.contentScripts.register({
+    const reg = await browser.contentScripts.register({
       matches: ["<all_urls>"],
       js: [{ file: "xhr_hook_content.js" }],
       runAt: "document_start",
       allFrames: false,
     });
+    // If network capture was toggled off while we were registering, undo it.
+    if (!capabilities.network) {
+      try { await reg.unregister(); } catch {}
+      return;
+    }
+    xhrHookRegistration = reg;
     console.log("[BrowserBridge] XHR/fetch content script registered");
   } catch (err) {
     console.error("[BrowserBridge] Failed to register XHR hook content script:", err);
+  } finally {
+    xhrHookRegistering = false;
   }
 }
 
@@ -1069,7 +981,6 @@ function updateListenerRegistrations() {
 browser.tabs.onUpdated.addListener((tabId, changeInfo) => {
   if (changeInfo.status === "loading") {
     consoleInjectedTabs.delete(tabId);
-    xhrHookInjectedTabs.delete(tabId);
 
     // Only inject into monitored tabs to avoid unnecessary IPC across all tabs
     if (!isTabMonitored(tabId)) {
@@ -1099,9 +1010,16 @@ browser.tabs.onUpdated.addListener((tabId, changeInfo) => {
 // Clean up tab-associated state on tab close
 browser.tabs.onRemoved.addListener((tabId) => {
   consoleInjectedTabs.delete(tabId);
-  xhrHookInjectedTabs.delete(tabId);
   if (monitoredTabId === tabId) {
     monitoredTabId = null;
+    // Re-select the active tab so we keep monitoring a single tab rather than
+    // sitting in the "none" state (which would show a stale tab in the popup).
+    browser.tabs.query({ active: true, currentWindow: true }).then((tabs) => {
+      if (tabs.length > 0) {
+        monitoredTabId = tabs[0].id;
+        if (capabilities.console) injectConsoleCapture(monitoredTabId).catch(() => {});
+      }
+    }).catch(() => {});
   }
   // Clean up pending requests for the closed tab
   for (const [key, entry] of pendingRequests) {
@@ -1131,10 +1049,10 @@ async function handleStartWsCapture(msg) {
 
   const tabId = tab.id;
 
-  // Inject relay + WS constructor override in a single executeScript call
+  // Inject the content-script relay + a page-world WS constructor override.
   const combinedCode = `
     (function() {
-      // --- Relay: content script context, bridges postMessage -> runtime.sendMessage ---
+      // --- Relay: content-script context, bridges postMessage -> runtime.sendMessage ---
       if (!window.__browserBridgeWsRelay) {
         window.__browserBridgeWsRelay = true;
         window.addEventListener("message", function(event) {
@@ -1150,75 +1068,65 @@ async function handleStartWsCapture(msg) {
         });
       }
 
-      // --- WS constructor override: page context via wrappedJSObject for Firefox ---
-      const w = window.wrappedJSObject || window;
-      if (w.__browserBridgeWsCapture) {
-        w.__browserBridgeWsCapture.patterns.add(${JSON.stringify(urlPattern)});
-        return;
-      }
+      // --- WS constructor override: injected into the PAGE world via <script>.
+      // Assigning a content-script function onto the page window (even via
+      // wrappedJSObject) does not work under Firefox Xray wrappers, so the hook
+      // must be defined in the page context itself. ---
+      var s = document.createElement("script");
+      s.textContent = "(" + function(pattern) {
+        if (window.__browserBridgeWsCapture) {
+          window.__browserBridgeWsCapture.patterns.push(pattern);
+          return;
+        }
+        var patterns = [pattern];
+        var OriginalWebSocket = window.WebSocket;
+        window.__browserBridgeWsCapture = { patterns: patterns, original: OriginalWebSocket };
 
-      const patterns = new Set([${JSON.stringify(urlPattern)}]);
-      const OriginalWebSocket = w.WebSocket;
-
-      w.__browserBridgeWsCapture = { patterns, original: OriginalWebSocket };
-
-      const NewWebSocket = function(url, protocols) {
-        const socket = protocols
-          ? new OriginalWebSocket(url, protocols)
-          : new OriginalWebSocket(url);
-
-        let capturing = false;
-        for (const pattern of patterns) {
-          if (new RegExp(pattern, "i").test(url)) {
-            capturing = true;
-            break;
+        var NewWebSocket = function(url, protocols) {
+          var socket = protocols ? new OriginalWebSocket(url, protocols) : new OriginalWebSocket(url);
+          var capturing = false;
+          for (var i = 0; i < patterns.length; i++) {
+            try { if (new RegExp(patterns[i], "i").test(url)) { capturing = true; break; } } catch(e) {}
           }
-        }
-
-        if (capturing) {
-          const originalSend = socket.send.bind(socket);
-          socket.send = function(data) {
-            window.postMessage({
-              __browserBridgeWsFrame: true,
-              direction: "sent",
-              data: typeof data === "string" ? data : "[binary]",
-              url: url,
-              timestamp: Date.now(),
-            }, "*");
-            return originalSend(data);
-          };
-
-          socket.addEventListener("message", function(event) {
-            window.postMessage({
-              __browserBridgeWsFrame: true,
-              direction: "received",
-              data: typeof event.data === "string" ? event.data : "[binary]",
-              url: url,
-              timestamp: Date.now(),
-            }, "*");
-          });
-        }
-
-        return socket;
-      };
-      NewWebSocket.prototype = OriginalWebSocket.prototype;
-      NewWebSocket.CONNECTING = OriginalWebSocket.CONNECTING;
-      NewWebSocket.OPEN = OriginalWebSocket.OPEN;
-      NewWebSocket.CLOSING = OriginalWebSocket.CLOSING;
-      NewWebSocket.CLOSED = OriginalWebSocket.CLOSED;
-      w.WebSocket = NewWebSocket;
+          if (capturing) {
+            var originalSend = socket.send.bind(socket);
+            socket.send = function(data) {
+              try {
+                window.postMessage({ __browserBridgeWsFrame: true, direction: "sent", data: typeof data === "string" ? data : "[binary]", url: url, timestamp: Date.now() }, "*");
+              } catch(e) {}
+              return originalSend(data);
+            };
+            socket.addEventListener("message", function(event) {
+              window.postMessage({ __browserBridgeWsFrame: true, direction: "received", data: typeof event.data === "string" ? event.data : "[binary]", url: url, timestamp: Date.now() }, "*");
+            });
+          }
+          return socket;
+        };
+        NewWebSocket.prototype = OriginalWebSocket.prototype;
+        NewWebSocket.CONNECTING = OriginalWebSocket.CONNECTING;
+        NewWebSocket.OPEN = OriginalWebSocket.OPEN;
+        NewWebSocket.CLOSING = OriginalWebSocket.CLOSING;
+        NewWebSocket.CLOSED = OriginalWebSocket.CLOSED;
+        window.WebSocket = NewWebSocket;
+      } + ")(" + ${JSON.stringify(JSON.stringify(urlPattern))} + ");";
+      (document.documentElement || document).appendChild(s);
+      s.remove();
     })();
   `;
   await browser.tabs.executeScript(tabId, { code: combinedCode });
 
-  // Count matched connections
+  // Count already-open connections that match. Note these were constructed
+  // before the hook installed, so they will NOT emit frames until reload.
   const regex = new RegExp(urlPattern, "i");
   let matched = 0;
   for (const url of trackedWsConnections.keys()) {
     if (regex.test(url)) matched++;
   }
 
-  return { matched_connections: matched };
+  return {
+    matched_connections: matched,
+    note: "Only WebSockets opened after capture starts are captured; reload the page to capture pre-existing connections.",
+  };
 }
 
 async function handleStopWsCapture(msg) {
@@ -1230,14 +1138,18 @@ async function handleStopWsCapture(msg) {
 
   const code = `
     (function() {
-      const w = window.wrappedJSObject || window;
-      if (w.__browserBridgeWsCapture) {
-        w.__browserBridgeWsCapture.patterns.delete(${JSON.stringify(urlPattern)});
-        if (w.__browserBridgeWsCapture.patterns.size === 0) {
-          w.WebSocket = w.__browserBridgeWsCapture.original;
-          delete w.__browserBridgeWsCapture;
+      var s = document.createElement("script");
+      s.textContent = "(" + function(pattern) {
+        var cap = window.__browserBridgeWsCapture;
+        if (!cap) return;
+        cap.patterns = cap.patterns.filter(function(p) { return p !== pattern; });
+        if (cap.patterns.length === 0) {
+          window.WebSocket = cap.original;
+          delete window.__browserBridgeWsCapture;
         }
-      }
+      } + ")(" + ${JSON.stringify(JSON.stringify(urlPattern))} + ");";
+      (document.documentElement || document).appendChild(s);
+      s.remove();
     })();
   `;
   await browser.tabs.executeScript(tab.id, { code });
@@ -1256,6 +1168,16 @@ browser.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   }
 
   if (msg.type === "ws_frame_relay") {
+    // Gate on capability and an active matching pattern so frames from sockets
+    // that were captured before stop_ws_capture (whose live send/message hooks
+    // keep firing) are dropped instead of forwarded after capture stopped.
+    if (!capabilities.websocket) return;
+    const url = msg.connection_url || "";
+    let matches = false;
+    for (const p of wsCapturingPatterns) {
+      try { if (new RegExp(p, "i").test(url)) { matches = true; break; } } catch {}
+    }
+    if (!matches) return;
     send({
       type: "ws_frame",
       connection_url: msg.connection_url,
@@ -1289,7 +1211,6 @@ browser.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     trackedWsConnections.clear();
     wsCapturingPatterns.clear();
     consoleInjectedTabs.clear();
-    xhrHookInjectedTabs.clear();
     xhrBodyBuffer.clear();
     sendResponse({ ok: true });
     return;
@@ -1335,6 +1256,12 @@ browser.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
   if (msg.type === "set_monitored_tab") {
     monitoredTabId = msg.tabId;
+    // Eagerly inject console capture into the newly selected tab (matches the
+    // console-toggle and startup paths); otherwise logs before the next
+    // navigation are lost.
+    if (capabilities.console && monitoredTabId !== null) {
+      injectConsoleCapture(monitoredTabId).catch(() => {});
+    }
     sendResponse({ ok: true, monitoredTabId });
     return;
   }

@@ -54,3 +54,17 @@ class TestSafeRegexSearch:
         assert "pattern0" in _REGEX_CACHE
         assert "pattern1" not in _REGEX_CACHE
         assert "new_pattern" in _REGEX_CACHE
+
+    def test_invalid_patterns_do_not_grow_cache_unbounded(self):
+        """Distinct invalid patterns cache None but still respect the size cap."""
+        for i in range(MAX_REGEX_CACHE_SIZE + 20):
+            _safe_regex_search(f"[bad{i}", "text")  # each is an invalid regex
+        assert len(_REGEX_CACHE) <= MAX_REGEX_CACHE_SIZE
+
+    def test_search_recovers_after_runaway_pattern(self):
+        """A catastrophic pattern must not poison later valid searches."""
+        # Runaway match times out / recurses and is abandoned (kept small so the
+        # abandoned worker thread does not stall interpreter shutdown).
+        _safe_regex_search(r"(a*)*b", "a" * 22)
+        # A subsequent valid pattern must still work (fresh executor).
+        assert _safe_regex_search(r"foo", "foobar") is True
