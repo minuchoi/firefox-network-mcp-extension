@@ -360,3 +360,81 @@ async def test_get_capture_status_folds_in_server_stores(mcp_env):
     assert result["monitored_tab_id"] == 7
     assert result["server_stores"]["requests_stored"] == 1
     assert "wss://x.*" in result["server_stores"]["active_ws_captures"]
+
+
+# ─── interaction tools ───────────────────────────────────────────────────────
+
+
+async def test_navigate_delegates(mcp_env):
+    mcp, _, _, manager = mcp_env
+    manager.send_request.return_value = {"ok": True, "tab_id": 3, "url": "https://x.com"}
+    result = await _call(mcp, "navigate", {"url": "https://x.com"})
+    assert result["ok"] is True
+    manager.send_request.assert_awaited_once_with("navigate", {"url": "https://x.com"})
+
+
+async def test_navigate_missing_url(mcp_env):
+    mcp, *_ = mcp_env
+    result = await _call(mcp, "navigate", {})
+    assert isinstance(result, str)
+    assert "url" in result.lower() or "required" in result.lower()
+
+
+async def test_navigate_extension_error(mcp_env):
+    mcp, _, _, manager = mcp_env
+    manager.send_request.return_value = {"error": "Only http(s) URLs are allowed, got: file:"}
+    result = await _call(mcp, "navigate", {"url": "file:///etc/passwd"})
+    assert result["error"]["code"] == "extension_error"
+
+
+async def test_reload_defaults_bypass_cache_false(mcp_env):
+    mcp, _, _, manager = mcp_env
+    manager.send_request.return_value = {"ok": True, "tab_id": 1}
+    await _call(mcp, "reload")
+    manager.send_request.assert_awaited_once_with("reload", {"bypass_cache": False})
+
+
+async def test_reload_bypass_cache_true(mcp_env):
+    mcp, _, _, manager = mcp_env
+    manager.send_request.return_value = {"ok": True, "tab_id": 1}
+    await _call(mcp, "reload", {"bypass_cache": True})
+    manager.send_request.assert_awaited_once_with("reload", {"bypass_cache": True})
+
+
+async def test_click_delegates_and_strips_msg_id(mcp_env):
+    mcp, _, _, manager = mcp_env
+    manager.send_request.return_value = {"msg_id": "z", "ok": True, "tag": "button"}
+    result = await _call(mcp, "click", {"selector": "#submit"})
+    assert result == {"ok": True, "tag": "button"}
+    manager.send_request.assert_awaited_once_with("click", {"selector": "#submit"})
+
+
+async def test_click_element_not_found(mcp_env):
+    mcp, _, _, manager = mcp_env
+    manager.send_request.return_value = {"error": "No element found for selector: #nope"}
+    result = await _call(mcp, "click", {"selector": "#nope"})
+    assert result["error"]["code"] == "extension_error"
+
+
+async def test_click_missing_selector(mcp_env):
+    mcp, *_ = mcp_env
+    result = await _call(mcp, "click", {})
+    assert isinstance(result, str)
+    assert "selector" in result.lower() or "required" in result.lower()
+
+
+async def test_fill_delegates(mcp_env):
+    mcp, _, _, manager = mcp_env
+    manager.send_request.return_value = {"ok": True, "tag": "input"}
+    result = await _call(mcp, "fill", {"selector": "#email", "value": "a@b.com"})
+    assert result["ok"] is True
+    manager.send_request.assert_awaited_once_with(
+        "fill", {"selector": "#email", "value": "a@b.com"}
+    )
+
+
+async def test_fill_missing_value(mcp_env):
+    mcp, *_ = mcp_env
+    result = await _call(mcp, "fill", {"selector": "#email"})
+    assert isinstance(result, str)
+    assert "value" in result.lower() or "required" in result.lower()

@@ -28,6 +28,15 @@ Connects Firefox to Claude Code via the [Model Context Protocol](https://modelco
 | `get_screenshot` | Capture a PNG/JPEG screenshot of the monitored tab |
 | `get_storage` | Get localStorage, sessionStorage, and cookies (including HttpOnly) |
 
+**Interaction** (requires the `interact` capability, off by default)
+
+| Tool | Description |
+|------|-------------|
+| `navigate` | Navigate the monitored tab to an http(s) URL |
+| `reload` | Reload the monitored tab (optional cache bypass) |
+| `click` | Click the first element matching a CSS selector |
+| `fill` | Set an input/textarea/select/contenteditable value and fire input/change events |
+
 **Diagnostics**
 
 | Tool | Description |
@@ -125,8 +134,9 @@ Click the extension icon in the Firefox toolbar to open the control panel. From 
 | **DOM / HTML** | Page queries, HTML, screenshots, storage | `get_page_info`, `query_dom`, `get_page_html`, `get_screenshot`, `get_storage` |
 | **Console Logs** | Console output capture | `get_console_logs` |
 | **WebSocket Frames** | WS message interception | `start_ws_capture`, `stop_ws_capture`, `get_ws_frames` |
+| **Interact** | Click, type, and navigate (mutates the page; **off by default**) | `navigate`, `reload`, `click`, `fill` |
 
-When a capability is disabled, the corresponding MCP tools return a "capability disabled" error. Settings persist across browser restarts via `browser.storage.local`.
+When a capability is disabled, the corresponding MCP tools return a "capability disabled" error. Settings persist across browser restarts via `browser.storage.local`. `get_capture_status` is never gated, so diagnostics work even when everything else is off.
 
 This is useful for limiting the amount of data flowing through the bridge -- for example, disable network capture when you only need DOM queries, or turn off everything except WebSocket frames during a targeted debugging session.
 
@@ -140,6 +150,9 @@ Once everything is connected, you can ask Claude Code things like:
 - "Show me the console errors from the current page"
 - "Search the captured network traffic for any requests containing 'auth'"
 - "Get the full response body of that 500 error request"
+- "Take a screenshot of the page" / "Show me the cookies and localStorage"
+- "Navigate to the login page, fill in the email field, and click submit" (needs the Interact toggle on)
+- "Why am I not seeing any network requests?" (uses `get_capture_status`)
 
 ## Tool Reference
 
@@ -218,6 +231,39 @@ Get the current page's `localStorage`, `sessionStorage`, and cookies (including 
 
 Diagnose what the extension is capturing: connection state, monitored tab, capability toggles, whether the network/console/XHR hooks are actually present on the current tab (surfacing CSP-blocked injection), buffer counts, and server-side store totals. No parameters. Use this when a capture tool unexpectedly returns nothing.
 
+### navigate
+
+Navigate the monitored tab to a URL. Only `http`/`https` URLs are allowed. Requires the `interact` capability.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `url` | string | yes | The http(s) URL to load |
+
+### reload
+
+Reload the monitored tab. Requires the `interact` capability.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `bypass_cache` | boolean | no | Hard reload bypassing the cache (default false) |
+
+### click
+
+Click the first element matching a CSS selector. Fires a real DOM click event. Requires the `interact` capability.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `selector` | string | yes | CSS selector of the element to click |
+
+### fill
+
+Set the value of an input, textarea, select, or contenteditable element and fire `input`/`change` events (using the native value setter so frameworks like React register the change). Requires the `interact` capability.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `selector` | string | yes | CSS selector of the field |
+| `value` | string | yes | Value to set |
+
 ### start_ws_capture
 
 Start capturing WebSocket frames for connections matching a URL pattern. Frames are not captured by default -- you must call this first.
@@ -248,7 +294,7 @@ Retrieve captured WebSocket frames.
 
 The MCP server (`src/mcp_server/server.py`) launches two concurrent async tasks:
 
-- **MCP stdio server** -- communicates with Claude Code over stdin/stdout using the MCP protocol. Exposes 13 tools.
+- **MCP stdio server** -- communicates with Claude Code over stdin/stdout using the MCP protocol. Exposes 17 tools.
 - **WebSocket server** -- listens on `ws://127.0.0.1:7865` for the Firefox extension to connect. Connections whose `Origin` is not a `moz-extension://` origin are rejected, so a web page cannot open the port and impersonate the extension.
 
 The Firefox extension runs a persistent background script that:

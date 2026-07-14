@@ -30,11 +30,11 @@ The MCP server is configured in `.mcp.json` to launch via `uv run`.
    - Captures response bodies via `filterResponseData` (primary) and page-level XHR/fetch hooking (fallback for POST responses where `filterResponseData` fails)
    - Injects content scripts on-demand for DOM queries, console log capture, and WebSocket frame interception. Console capture and WebSocket interception both run in the **page world** via `<script>` tag injection (not the content-script sandbox): a content-script `console` override or `window.WebSocket` assignment does not affect the page's own calls under Firefox Xray isolation. Console logs are stored on the page's `window.__browserBridgeConsoleLogs` and read back through `window.wrappedJSObject`.
    - Sends captured data and tool responses as JSON messages to the server
-   - Popup UI (`popup.html` / `popup.js`) with toggles for network, DOM, console, and WebSocket capabilities
+   - Popup UI (`popup.html` / `popup.js`) with toggles for network, DOM, console, WebSocket, and interact capabilities
    - Capability state persisted via `browser.storage.local`
 
 2. **Python MCP Server** (`src/mcp_server/`) — Async server running two concurrent tasks:
-   - **MCP stdio server** — exposes 13 tools to Claude Code
+   - **MCP stdio server** — exposes 17 tools to Claude Code
    - **WebSocket server** (port 7865) — receives data from and sends commands to the extension
    - Both tasks run under `asyncio.wait(..., FIRST_COMPLETED)`. If the WS server fails at startup (e.g. port already bound) the error is surfaced immediately instead of silently running MCP with a dead bridge. SIGTERM/SIGINT set a shutdown event **and** cancel the MCP task (which otherwise blocks on stdin), so the process actually exits.
 
@@ -86,6 +86,8 @@ The MCP server is configured in `.mcp.json` to launch via `uv run`.
 
 - `src/mcp_server/server.py` — Entry point, wires up MCP + WebSocket servers
 - `src/mcp_server/tools.py` — All MCP tool definitions and dispatch logic (match/case). Most tools return a dict serialized to `TextContent`; `get_screenshot` returns an `ImageContent` (base64 PNG/JPEG) which `call_tool` passes through directly. On-demand tools are gated in the extension by capability (`dom`/`console`), except `get_capture_status` which is intentionally ungated so diagnostics work when capture is off.
+
+**Page interaction tools** (`navigate`, `reload`, `click`, `fill`) are gated by the `interact` capability, which **defaults to OFF** because these mutate the page. `navigate` restricts to `http`/`https` schemes. `click`/`fill` run via `executeScript` in the content script (calling DOM methods on shared page nodes works, unlike prototype overrides); `fill` uses the prototype's native `value` setter so framework value-trackers (React) register the change. `click`/`fill` refuse to run on a privileged page or a still-loading tab (`tab.status !== "complete"`) — the latter avoids `executeScript` queuing past the 5s request timeout and firing a duplicate action after the caller was told it failed. `click` refuses disabled elements (their `click()` is a spec no-op). `fill` reads the value back and returns a `warning` if the browser silently rejected it (a `<select>` with no matching option, or `input[type=number]` given non-numeric text). Known limitation: `fill` runs from the content script, so a framework that ignores programmatic value changes despite the native-setter trick may not update; the `input`/`change` events still fire.
 - `src/mcp_server/ws_bridge.py` — WebSocket server, ConnectionManager, message routing
 - `src/mcp_server/request_store.py` — RequestStore and WsFrameStore ring buffers
 - `extension/background.js` — All extension logic (WS client, network capture, DOM tools, WS frame capture, capability toggles)

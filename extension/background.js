@@ -53,7 +53,9 @@ function pendingKey(tabId, requestId) {
 
 // ─── Capability Toggles ─────────────────────────────────────────────────────
 
-const capabilities = { network: true, dom: true, console: true, websocket: true };
+// `interact` defaults OFF: it lets tools mutate the page (click/fill/navigate),
+// so it must be explicitly enabled rather than available by surprise.
+const capabilities = { network: true, dom: true, console: true, websocket: true, interact: false };
 
 async function loadCapabilities() {
   try {
@@ -220,6 +222,34 @@ async function handleServerMessage(raw) {
       case "get_capture_status":
         // Intentionally ungated: diagnostics must work even when capture is off.
         response = await handleGetCaptureStatus();
+        break;
+      case "navigate":
+        if (!capabilities.interact) {
+          response = { error: "Capability disabled by user: interact" };
+          break;
+        }
+        response = await handleNavigate(msg);
+        break;
+      case "reload":
+        if (!capabilities.interact) {
+          response = { error: "Capability disabled by user: interact" };
+          break;
+        }
+        response = await handleReload(msg);
+        break;
+      case "click":
+        if (!capabilities.interact) {
+          response = { error: "Capability disabled by user: interact" };
+          break;
+        }
+        response = await handleClick(msg);
+        break;
+      case "fill":
+        if (!capabilities.interact) {
+          response = { error: "Capability disabled by user: interact" };
+          break;
+        }
+        response = await handleFill(msg);
         break;
       case "start_ws_capture":
         if (!capabilities.websocket) {
@@ -596,6 +626,134 @@ async function handleGetCaptureStatus() {
 
   status.warnings = warnings;
   return status;
+}
+
+// ─── Page Interaction (gated by the `interact` capability) ────────────────────
+
+async function handleNavigate(msg) {
+  const tab = await getTargetTab();
+  if (!tab) return { error: "No active tab" };
+  if (!msg.url || typeof msg.url !== "string") return { error: "Missing or invalid url" };
+
+  let parsed;
+  try {
+    parsed = new URL(msg.url);
+  } catch {
+    return { error: "Invalid URL: " + msg.url };
+  }
+  // Restrict to http(s): block file:, about:, javascript:, data:, moz-extension:, etc.
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+    return { error: "Only http(s) URLs are allowed, got: " + parsed.protocol };
+  }
+
+  try {
+    await browser.tabs.update(tab.id, { url: msg.url });
+    return { ok: true, tab_id: tab.id, url: msg.url };
+  } catch (err) {
+    return { error: err.message };
+  }
+}
+
+async function handleReload(msg) {
+  const tab = await getTargetTab();
+  if (!tab) return { error: "No active tab" };
+  try {
+    await browser.tabs.reload(tab.id, { bypassCache: !!msg.bypass_cache });
+    return { ok: true, tab_id: tab.id };
+  } catch (err) {
+    return { error: err.message };
+  }
+}
+
+async function handleClick(msg) {
+  const tab = await getTargetTab();
+  if (!tab) return { error: "No active tab" };
+  if (!msg.selector || typeof msg.selector !== "string") return { error: "Missing or invalid selector" };
+  if (isPrivilegedTab(tab)) return { error: `Cannot interact with privileged page: ${tab.url.split(":")[0]}:` };
+  // Fail fast while loading: executeScript would otherwise queue until
+  // document_idle, possibly past the server's 5s timeout, then fire the click
+  // after the caller was told it failed (risking a duplicate side effect).
+  if (tab.status && tab.status !== "complete") {
+    return { error: "Tab is still loading; retry once it finishes" };
+  }
+
+  // Calling DOM methods on page elements works from the content script (the DOM
+  // is shared); el.click() fires a real event the page's own listeners receive.
+  const code = `
+    (function() {
+      var sel = ${JSON.stringify(msg.selector)};
+      var el = document.querySelector(sel);
+      if (!el) return { error: "No element found for selector: " + sel };
+      if (el.disabled) return { error: "Element is disabled: " + sel };
+      try {
+        el.scrollIntoView({ block: "center", inline: "center" });
+        el.click();
+        return { ok: true, tag: el.tagName.toLowerCase() };
+      } catch (e) { return { error: String(e) }; }
+    })();
+  `;
+  try {
+    const results = await browser.tabs.executeScript(tab.id, { code });
+    if (!results || !results[0]) return { error: "Script execution failed" };
+    return results[0];
+  } catch (err) {
+    return { error: err.message };
+  }
+}
+
+async function handleFill(msg) {
+  const tab = await getTargetTab();
+  if (!tab) return { error: "No active tab" };
+  if (!msg.selector || typeof msg.selector !== "string") return { error: "Missing or invalid selector" };
+  if (isPrivilegedTab(tab)) return { error: `Cannot interact with privileged page: ${tab.url.split(":")[0]}:` };
+  if (tab.status && tab.status !== "complete") {
+    return { error: "Tab is still loading; retry once it finishes" };
+  }
+  const value = msg.value != null ? String(msg.value) : "";
+
+  const code = `
+    (function() {
+      var sel = ${JSON.stringify(msg.selector)};
+      var val = ${JSON.stringify(value)};
+      var el = document.querySelector(sel);
+      if (!el) return { error: "No element found for selector: " + sel };
+      var tag = el.tagName.toLowerCase();
+      var fillable = tag === "input" || tag === "textarea" || tag === "select" || el.isContentEditable;
+      if (!fillable) return { error: "Element is not fillable (input/textarea/select/contenteditable): " + tag };
+      try {
+        el.focus();
+        if (el.isContentEditable) {
+          el.textContent = val;
+        } else if (tag === "input" || tag === "textarea") {
+          // Use the prototype's native value setter so frameworks that track the
+          // input value (e.g. React) register the change rather than ignoring it.
+          try {
+            var desc = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(el), "value");
+            if (desc && desc.set) desc.set.call(el, val); else el.value = val;
+          } catch (e) { el.value = val; }
+        } else {
+          el.value = val; // select
+        }
+        el.dispatchEvent(new Event("input", { bubbles: true }));
+        el.dispatchEvent(new Event("change", { bubbles: true }));
+        // Read back: the browser may silently reject the value (a <select> with
+        // no matching option clears to "", input[type=number] rejects non-numeric).
+        var applied = el.isContentEditable ? el.textContent : el.value;
+        var res = { ok: true, tag: tag, value: applied };
+        if (!el.isContentEditable && applied !== val) {
+          res.warning = "Value was not applied as-is (browser sanitization or no matching option); field value is now " + JSON.stringify(applied);
+        }
+        return res;
+      } catch (e) { return { error: String(e) }; }
+    })();
+  `;
+  try {
+    const results = await browser.tabs.executeScript(tab.id, { code });
+    if (!results || !results[0]) return { error: "Script execution failed" };
+    return results[0];
+  } catch (err) {
+    return { error: err.message };
+  }
 }
 
 // ─── XHR/Fetch Response Body Capture ────────────────────────────────────────

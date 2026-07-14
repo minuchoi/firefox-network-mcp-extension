@@ -228,6 +228,65 @@ def register_tools(
                 inputSchema={"type": "object", "properties": {}},
             ),
             Tool(
+                name="navigate",
+                description=(
+                    "Navigate the monitored tab to a URL (http/https only). "
+                    "Requires the 'interact' capability to be enabled in the popup."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "url": {"type": "string", "description": "The http(s) URL to load"},
+                    },
+                    "required": ["url"],
+                },
+            ),
+            Tool(
+                name="reload",
+                description=(
+                    "Reload the monitored tab. Requires the 'interact' capability."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "bypass_cache": {
+                            "type": "boolean",
+                            "description": "Bypass the cache (hard reload). Default false.",
+                        },
+                    },
+                },
+            ),
+            Tool(
+                name="click",
+                description=(
+                    "Click the first element matching a CSS selector on the "
+                    "monitored tab. Requires the 'interact' capability."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "selector": {"type": "string", "description": "CSS selector to click"},
+                    },
+                    "required": ["selector"],
+                },
+            ),
+            Tool(
+                name="fill",
+                description=(
+                    "Set the value of an input, textarea, select, or "
+                    "contenteditable element matching a CSS selector and fire "
+                    "input/change events. Requires the 'interact' capability."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "selector": {"type": "string", "description": "CSS selector of the field"},
+                        "value": {"type": "string", "description": "Value to set"},
+                    },
+                    "required": ["selector", "value"],
+                },
+            ),
+            Tool(
                 name="start_ws_capture",
                 description=(
                     "Start capturing WebSocket frames for connections matching "
@@ -339,6 +398,14 @@ def register_tools(
                 return await _get_storage(args)
             case "get_capture_status":
                 return await _get_capture_status()
+            case "navigate":
+                return await _navigate(args)
+            case "reload":
+                return await _reload(args)
+            case "click":
+                return await _click(args)
+            case "fill":
+                return await _fill(args)
             case "start_ws_capture":
                 return await _start_ws_capture(args)
             case "stop_ws_capture":
@@ -463,6 +530,33 @@ def register_tools(
             "active_ws_captures": list(ws_store.active_captures),
         }
         return resp
+
+    def _extension_result(resp: dict[str, Any]) -> dict[str, Any]:
+        if "error" in resp:
+            return _error_response("extension_error", resp["error"])
+        resp.pop("msg_id", None)
+        return resp
+
+    async def _navigate(args: dict[str, Any]) -> dict[str, Any]:
+        url = _require_param(args, "url")
+        return _extension_result(await manager.send_request("navigate", {"url": url}))
+
+    async def _reload(args: dict[str, Any]) -> dict[str, Any]:
+        params = {"bypass_cache": bool(args.get("bypass_cache", False))}
+        return _extension_result(await manager.send_request("reload", params))
+
+    async def _click(args: dict[str, Any]) -> dict[str, Any]:
+        selector = _require_param(args, "selector")
+        return _extension_result(
+            await manager.send_request("click", {"selector": selector})
+        )
+
+    async def _fill(args: dict[str, Any]) -> dict[str, Any]:
+        selector = _require_param(args, "selector")
+        value = _require_param(args, "value")
+        return _extension_result(
+            await manager.send_request("fill", {"selector": selector, "value": value})
+        )
 
     async def _start_ws_capture(args: dict[str, Any]) -> dict[str, Any]:
         url_pattern = _require_param(args, "url_pattern")
