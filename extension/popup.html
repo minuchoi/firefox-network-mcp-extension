@@ -281,14 +281,15 @@
     </select>
   </div>
 
-  <div class="capabilities" id="capabilities">
+  <!-- Starts disabled/unchecked; refreshStatus() reflects the real state on load -->
+  <div class="capabilities disabled" id="capabilities">
     <div class="capability-row">
       <div class="capability-info">
         <span class="capability-name">Network Requests</span>
         <span class="capability-desc">Captures HTTP traffic continuously</span>
       </div>
       <label class="toggle">
-        <input type="checkbox" data-capability="network" checked>
+        <input type="checkbox" data-capability="network" disabled>
         <span class="toggle-track"></span>
       </label>
     </div>
@@ -299,7 +300,7 @@
         <span class="capability-desc">On-demand page queries</span>
       </div>
       <label class="toggle">
-        <input type="checkbox" data-capability="dom" checked>
+        <input type="checkbox" data-capability="dom" disabled>
         <span class="toggle-track"></span>
       </label>
     </div>
@@ -310,7 +311,7 @@
         <span class="capability-desc">Captures logs from toggle-on</span>
       </div>
       <label class="toggle">
-        <input type="checkbox" data-capability="console" checked>
+        <input type="checkbox" data-capability="console" disabled>
         <span class="toggle-track"></span>
       </label>
     </div>
@@ -321,7 +322,7 @@
         <span class="capability-desc">Captures new WS connections when started</span>
       </div>
       <label class="toggle">
-        <input type="checkbox" data-capability="websocket" checked>
+        <input type="checkbox" data-capability="websocket" disabled>
         <span class="toggle-track"></span>
       </label>
     </div>

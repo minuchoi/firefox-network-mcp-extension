@@ -25,6 +25,12 @@ REQUEST_TIMEOUT = 5.0  # seconds
 MAX_MESSAGE_SIZE = 10 * 1024 * 1024  # 10 MB
 
 
+def _as_str_dict(value: Any) -> dict[str, str]:
+    """Coerce untrusted header payloads to a dict. A non-dict (e.g. a list from
+    a malformed peer) would otherwise crash matches_search's .items() later."""
+    return value if isinstance(value, dict) else {}
+
+
 class ConnectionManager:
     """Manages the single WebSocket connection to the Firefox extension."""
 
@@ -41,6 +47,13 @@ class ConnectionManager:
     def connected(self) -> bool:
         return self._connection is not None
 
+    def _fail_pending(self, message: str) -> None:
+        """Fail all outstanding request futures. Caller must hold the lock."""
+        for fut in list(self._pending.values()):
+            if not fut.done():
+                fut.set_exception(ConnectionError(message))
+        self._pending.clear()
+
     async def register(self, ws: ServerConnection) -> None:
         async with self._lock:
             if self._connection is not None:
@@ -49,6 +62,10 @@ class ConnectionManager:
                     await self._connection.close()
                 except Exception:
                     pass  # connection may already be closed or in a bad state
+                # The old connection's unregister() will no-op (self._connection
+                # is now the new ws), so fail its pending futures here rather
+                # than letting callers wait out the full request timeout.
+                self._fail_pending("Extension connection replaced")
             self._connection = ws
             logger.info("Extension connected")
 
@@ -57,13 +74,7 @@ class ConnectionManager:
             if self._connection is ws:
                 self._connection = None
                 logger.info("Extension disconnected")
-                # Cancel all pending futures
-                for fut in list(self._pending.values()):
-                    if not fut.done():
-                        fut.set_exception(
-                            ConnectionError("Extension disconnected")
-                        )
-                self._pending.clear()
+                self._fail_pending("Extension disconnected")
 
     async def send_request(
         self, action: str, params: dict[str, Any] | None = None
@@ -110,6 +121,9 @@ class ConnectionManager:
             data = json.loads(raw)
         except json.JSONDecodeError:
             logger.warning("Invalid JSON from extension: %s", raw[:200])
+            return
+        if not isinstance(data, dict):
+            logger.warning("Non-object JSON from extension, ignoring: %s", raw[:200])
             return
 
         msg_type = data.get("type")
@@ -177,10 +191,10 @@ class ConnectionManager:
             url=url,
             method=str(data.get("method", "GET")),
             timestamp=timestamp,
-            request_headers=data.get("request_headers") or {},
+            request_headers=_as_str_dict(data.get("request_headers")),
             request_body=data.get("request_body"),
             status_code=status_code,
-            response_headers=data.get("response_headers") or {},
+            response_headers=_as_str_dict(data.get("response_headers")),
             response_body=raw_body,
             content_type=data.get("content_type"),
             ip=data.get("ip"),
@@ -218,7 +232,7 @@ class ConnectionManager:
     def _handle_xhr_body_patch(self, data: dict[str, Any]) -> None:
         """Patch a previously stored request with a response body from the XHR hook."""
         url = data.get("url")
-        method = data.get("method", "").upper()
+        method = (data.get("method") or "").upper()
         body = data.get("response_body")
 
         if not url or not body:
@@ -255,6 +269,19 @@ async def ws_handler(
     ws: ServerConnection, manager: ConnectionManager
 ) -> None:
     """Handle a single WebSocket connection from the extension."""
+    # Reject connections originating from a web page. The extension's background
+    # WebSocket has no web Origin (or a moz-extension:// one); a page that opens
+    # ws://127.0.0.1:7865 sends an http(s) Origin. Without this, any page could
+    # impersonate the extension and feed fabricated data to Claude.
+    try:
+        origin = ws.request.headers.get("Origin") if ws.request else None
+    except Exception:
+        origin = None
+    if origin and not origin.startswith("moz-extension://"):
+        logger.warning("Rejecting WS connection with disallowed Origin: %s", origin)
+        await ws.close(code=1008, reason="forbidden origin")
+        return
+
     await manager.register(ws)
     try:
         async for message in ws:

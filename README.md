@@ -224,13 +224,13 @@ Retrieve captured WebSocket frames.
 The MCP server (`src/mcp_server/server.py`) launches two concurrent async tasks:
 
 - **MCP stdio server** -- communicates with Claude Code over stdin/stdout using the MCP protocol. Exposes 10 tools.
-- **WebSocket server** -- listens on `ws://127.0.0.1:7865` for the Firefox extension to connect.
+- **WebSocket server** -- listens on `ws://127.0.0.1:7865` for the Firefox extension to connect. Connections whose `Origin` is not a `moz-extension://` origin are rejected, so a web page cannot open the port and impersonate the extension.
 
 The Firefox extension runs a persistent background script that:
 
 - Connects as a WebSocket client and auto-reconnects with exponential backoff on disconnection.
-- Passively captures all HTTP traffic using Firefox's `webRequest` API (listeners are registered dynamically and only active when network capture is enabled). Response bodies are captured via `filterResponseData` (primary) with two fallback mechanisms: cache-based re-fetch for GET requests, and page-level XHR/`fetch` hooking via dynamically registered content script (`document_start`) for POST/PUT/DELETE/PATCH responses where `filterResponseData` produces no data. Body capture (`filterResponseData`) is restricted to `xmlhttprequest` resource types (XHR/fetch API calls) -- document loads, scripts, stylesheets, images, fonts, and other non-API traffic skip body capture entirely, which dramatically reduces IPC overhead when monitoring all tabs. The hook communicates with the content script relay via synchronous DOM attribute + `dispatchEvent`, avoiding async `postMessage` races with page navigation. URLs are resolved to absolute before correlation. Captured data is stored in in-memory ring buffers -- 500 requests per tab, up to 20 tabs.
-- On demand, injects content scripts into the active tab to perform DOM queries, console log interception, and WebSocket frame capture.
+- Passively captures all HTTP traffic using Firefox's `webRequest` API (listeners are registered dynamically and only active when network capture is enabled). Response bodies are captured via `filterResponseData` (primary) with two fallback mechanisms: cache-based re-fetch for GET requests, and page-level XHR/`fetch` hooking via dynamically registered content script (`document_start`) for POST/PUT/DELETE/PATCH responses where `filterResponseData` produces no data. Body capture (`filterResponseData`) is restricted to `xmlhttprequest` resource types (XHR/fetch API calls) -- document loads, scripts, stylesheets, images, fonts, and other non-API traffic skip body capture entirely, which dramatically reduces IPC overhead. Monitoring is scoped to a single tab (the active tab, re-selected if the monitored tab closes). The hook communicates with the content script relay via synchronous DOM attribute + `dispatchEvent`, avoiding async `postMessage` races with page navigation. URLs are resolved to absolute before correlation. Captured data is stored in in-memory ring buffers -- 500 requests per tab, up to 20 tabs.
+- On demand, injects into the active tab to perform DOM queries, console log interception, and WebSocket frame capture. Console and WebSocket hooks run in the page world via injected `<script>` tags (a content-script `console`/`window.WebSocket` override does not intercept the page's own calls under Firefox Xray isolation); console logs are read back through `window.wrappedJSObject`.
 - Correlates requests and responses using UUID-based message IDs with asyncio Futures (5-second timeout on the server side).
 
 Only a single extension connection is allowed at a time.
@@ -264,7 +264,7 @@ Make sure the extension is loaded and the badge shows "ON". Check that the **Net
 Content script injection is blocked on privileged pages (`about:*`, `moz-extension:*`, and other restricted URLs). This is a Firefox security restriction.
 
 **Console logs are empty on first call**
-Console log capture requires a content script injection, which happens on the first `get_console_logs` call. Logs generated before that first call are not captured. Call the tool once, reproduce the console output, then call it again.
+Console log capture requires injecting a page-world hook, which happens when the console capability is toggled on, when the monitored tab is selected/navigates, or on the first `get_console_logs` call. Logs generated before the hook is installed are not captured. It is also injected as an inline `<script>`, so a strict `Content-Security-Policy` (`script-src` without `'unsafe-inline'`) blocks it, same as the XHR/fetch hook.
 
 **POST response bodies are missing on pages with strict CSP**
 The XHR/fetch hook fallback injects an inline `<script>` tag into the page. Pages with a strict `Content-Security-Policy` that blocks inline scripts (`script-src` without `'unsafe-inline'`) will prevent the hook from running. In that case, POST response bodies may be missing if Firefox's `filterResponseData` also fails (common with servers that send `connection: close` + gzip). GET responses are unaffected as they use a separate cache-based fallback.
@@ -274,7 +274,7 @@ This can happen if the response uses brotli (`br`) content-encoding and Firefox'
 
 ## Security Notes
 
-- The WebSocket server binds to `127.0.0.1` only -- not accessible from the network.
+- The WebSocket server binds to `127.0.0.1` only -- not accessible from the network. It also rejects connections whose `Origin` header is not `moz-extension://...`, so a malicious web page cannot open the port, impersonate the extension, and feed fabricated data to Claude. Note there is no shared-secret handshake, and captured XHR/fetch bodies relayed from the page world should be treated as page-controlled data.
 - No data is persisted to disk. All captured data lives in memory and is lost when the server stops.
 - The extension requires broad permissions (`<all_urls>`, `webRequest`, `webRequestBlocking`, `tabs`, `storage`) to capture network traffic across all sites. This is inherent to the functionality. However, all webRequest listeners and the XHR/fetch content script are only active when the corresponding capability is enabled — when disabled, the extension has near-zero overhead.
 - Use the extension popup toggles to limit data exposure -- disable capabilities you don't need.

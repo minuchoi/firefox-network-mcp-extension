@@ -43,6 +43,17 @@ function updateUI(response) {
     connectionInfo.textContent = response.wsUrl;
   }
 
+  // Keep the tab selector in sync with the background's monitored tab (the 2s
+  // refresh calls this), unless the user is actively choosing an option.
+  if (
+    response.monitoredTabId !== undefined &&
+    response.monitoredTabId !== null &&
+    tabSelect.options.length > 0 &&
+    document.activeElement !== tabSelect
+  ) {
+    tabSelect.value = String(response.monitoredTabId);
+  }
+
   if (response.stats) {
     statRequests.textContent = response.stats.pendingRequests;
     statWs.textContent = response.stats.trackedWsConnections;
@@ -85,6 +96,12 @@ function loadTabs() {
     }
     if (!tabSelect.value && tabSelect.options.length > 0) {
       tabSelect.value = tabSelect.options[0].value;
+      // Sync the background to the tab the UI shows so it monitors that tab
+      // rather than sitting in the "none" state while the popup implies a tab.
+      browser.runtime.sendMessage({
+        type: "set_monitored_tab",
+        tabId: Number(tabSelect.value),
+      }).catch(() => {});
     }
   }).catch((err) => {
     console.error("[BrowserBridge Popup] Failed to load tabs:", err);

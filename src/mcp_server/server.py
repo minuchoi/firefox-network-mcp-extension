@@ -37,37 +37,47 @@ async def _async_main() -> None:
 
     shutdown_event = asyncio.Event()
 
-    # Ensure clean shutdown on SIGTERM/SIGINT so the port is released
-    loop = asyncio.get_running_loop()
-    for sig in (signal.SIGTERM, signal.SIGINT):
-        loop.add_signal_handler(sig, shutdown_event.set)
-
-    # Start WebSocket server as a background task
-    ws_task = asyncio.create_task(
-        start_ws_server(manager, shutdown_event=shutdown_event)
-    )
+    async def _run_mcp() -> None:
+        async with stdio_server() as (read_stream, write_stream):
+            await mcp.run(
+                read_stream,
+                write_stream,
+                mcp.create_initialization_options(),
+            )
 
     logger.info("Starting MCP stdio server")
-    async with stdio_server() as (read_stream, write_stream):
-        await mcp.run(
-            read_stream,
-            write_stream,
-            mcp.create_initialization_options(),
-        )
+    mcp_task = asyncio.create_task(_run_mcp(), name="mcp")
+    ws_task = asyncio.create_task(
+        start_ws_server(manager, shutdown_event=shutdown_event), name="ws"
+    )
 
-    # Signal the WS server to shut down gracefully, then cancel as fallback
-    shutdown_event.set()
-    try:
-        await asyncio.wait_for(ws_task, timeout=5.0)
-    except asyncio.TimeoutError:
-        logger.warning("WebSocket server did not shut down cleanly, cancelling")
-        ws_task.cancel()
+    # Ensure shutdown on SIGTERM/SIGINT. Setting the event alone is not enough:
+    # mcp.run() blocks on stdin, so the main coroutine must be interrupted too.
+    loop = asyncio.get_running_loop()
+
+    def _handle_signal() -> None:
+        shutdown_event.set()
+        mcp_task.cancel()
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
         try:
-            await ws_task
-        except asyncio.CancelledError:
-            pass
-    except asyncio.CancelledError:
-        pass
+            loop.add_signal_handler(sig, _handle_signal)
+        except NotImplementedError:
+            pass  # signal handlers are unsupported on some platforms
+
+    # Run until either task finishes. If the WS server dies first (e.g. port
+    # 7865 already bound), surface it instead of silently running MCP with a
+    # dead bridge and re-raising the OSError only at shutdown.
+    done, _pending = await asyncio.wait(
+        {mcp_task, ws_task}, return_when=asyncio.FIRST_COMPLETED
+    )
+    if ws_task in done and not ws_task.cancelled() and ws_task.exception():
+        logger.error("WebSocket server failed: %s", ws_task.exception())
+
+    # Graceful shutdown of whatever is still running
+    shutdown_event.set()
+    mcp_task.cancel()
+    await asyncio.gather(mcp_task, ws_task, return_exceptions=True)
 
 
 if __name__ == "__main__":

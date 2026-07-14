@@ -54,6 +54,19 @@ class TestEviction:
         assert request_store.get("t2") is not None
         assert request_store.get("t4") is not None
 
+    def test_tab_eviction_is_lru_not_insertion_order(self, request_store):
+        # max_tabs=3. Fill tabs 1,2,3, then make tab 1 active again.
+        for tab in (1, 2, 3):
+            request_store.add(make_request(request_id=f"t{tab}", tab_id=tab))
+        request_store.add(make_request(request_id="t1b", tab_id=1))
+        # A 4th tab appears: the least-recently-active tab (2) is evicted,
+        # NOT tab 1 despite it being inserted first.
+        request_store.add(make_request(request_id="t4", tab_id=4))
+        assert request_store.get("t1b") is not None
+        assert request_store.get("t2") is None
+        assert request_store.get("t3") is not None
+        assert request_store.get("t4") is not None
+
 
 class TestFilter:
     def test_filter_no_filters(self, request_store):
