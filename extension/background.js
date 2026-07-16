@@ -15,6 +15,9 @@ const sendBuffer = [];
 
 let ws = null;
 let reconnectDelay = RECONNECT_BASE_MS;
+// Master on/off switch. When false the extension is fully inert: no WS
+// connection, no webRequest listeners, no content-script hooks. Persisted.
+let extensionEnabled = true;
 
 // In-flight request data, keyed by "tabId:requestId" to avoid cross-tab collision
 const pendingRequests = new Map();
@@ -76,9 +79,46 @@ async function saveCapabilities() {
   }
 }
 
+async function loadEnabled() {
+  try {
+    const stored = await browser.storage.local.get("enabled");
+    if (typeof stored.enabled === "boolean") extensionEnabled = stored.enabled;
+  } catch (err) {
+    console.warn("[BrowserBridge] Failed to load enabled state:", err);
+  }
+}
+
+async function saveEnabled() {
+  try {
+    await browser.storage.local.set({ enabled: extensionEnabled });
+  } catch (err) {
+    console.warn("[BrowserBridge] Failed to save enabled state:", err);
+  }
+}
+
+// Turn the whole extension on or off. Off tears down the WS connection and all
+// capture machinery; on reconnects and re-registers based on capabilities.
+async function setExtensionEnabled(enabled) {
+  extensionEnabled = enabled;
+  await saveEnabled();
+  updateListenerRegistrations(); // registers when on, tears everything down when off
+  if (enabled) {
+    reconnectDelay = RECONNECT_BASE_MS;
+    connect();
+    if (capabilities.console && monitoredTabId !== null) {
+      injectConsoleCapture(monitoredTabId).catch(() => {});
+    }
+  } else if (ws) {
+    try { ws.close(); } catch {}
+    // onclose sees extensionEnabled === false and will not schedule a reconnect.
+  }
+  refreshBadge();
+}
+
 // ─── WebSocket Client ────────────────────────────────────────────────────────
 
 function connect() {
+  if (!extensionEnabled) return; // master switch is off
   if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
     return;
   }
@@ -89,7 +129,7 @@ function connect() {
     console.log("[BrowserBridge] Connected to MCP server");
     reconnectDelay = RECONNECT_BASE_MS;
     ws.send(JSON.stringify({ type: "hello", version: "0.1.0" }));
-    updateBadge(true);
+    refreshBadge();
 
     // Drain buffered events
     while (sendBuffer.length > 0 && ws.readyState === WebSocket.OPEN) {
@@ -104,9 +144,11 @@ function connect() {
   };
 
   ws.onclose = () => {
-    console.log("[BrowserBridge] Disconnected, reconnecting...");
-    updateBadge(false);
-    scheduleReconnect();
+    refreshBadge();
+    if (extensionEnabled) {
+      console.log("[BrowserBridge] Disconnected, reconnecting...");
+      scheduleReconnect();
+    }
   };
 
   ws.onerror = () => {
@@ -115,6 +157,7 @@ function connect() {
 }
 
 function scheduleReconnect() {
+  if (!extensionEnabled) return;
   setTimeout(() => {
     connect();
   }, reconnectDelay);
@@ -133,9 +176,15 @@ function send(data) {
   }
 }
 
-function updateBadge(connected) {
-  const color = connected ? "#4CAF50" : "#F44336";
-  const text = connected ? "ON" : "OFF";
+function refreshBadge() {
+  let color, text;
+  if (!extensionEnabled) {
+    color = "#9E9E9E"; text = "OFF";  // grey: switched off by the user
+  } else if (isConnected()) {
+    color = "#4CAF50"; text = "ON";   // green: connected
+  } else {
+    color = "#F44336"; text = "OFF";  // red: enabled but not connected
+  }
   browser.browserAction.setBadgeBackgroundColor({ color });
   browser.browserAction.setBadgeText({ text });
 }
@@ -1286,6 +1335,12 @@ async function unregisterXhrHookContentScript() {
 // and on startup after loading persisted capabilities.
 
 function updateListenerRegistrations() {
+  // Master switch off: tear everything down regardless of capability toggles.
+  if (!extensionEnabled) {
+    unregisterWebRequestListeners();
+    unregisterXhrHookContentScript();
+    return;
+  }
   const needWebRequest = capabilities.network || capabilities.websocket;
   if (needWebRequest) {
     registerWebRequestListeners();
@@ -1516,6 +1571,7 @@ browser.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg.type === "get_status") {
     sendResponse({
       connected: isConnected(),
+      enabled: extensionEnabled,
       capabilities: { ...capabilities },
       monitoredTabId,
       stats: {
@@ -1537,6 +1593,16 @@ browser.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     xhrBodyBuffer.clear();
     sendResponse({ ok: true });
     return;
+  }
+
+  if (msg.type === "set_enabled") {
+    setExtensionEnabled(!!msg.enabled).then(() => {
+      sendResponse({ ok: true, enabled: extensionEnabled });
+    }).catch((err) => {
+      console.error("[BrowserBridge] Failed to set enabled state:", err);
+      sendResponse({ ok: false, error: err.message });
+    });
+    return true; // async sendResponse
   }
 
   if (msg.type === "set_capability") {
@@ -1592,8 +1658,8 @@ browser.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
 // ─── Init ────────────────────────────────────────────────────────────────────
 
-loadCapabilities().then(async () => {
-  connect();
+Promise.all([loadCapabilities(), loadEnabled()]).then(async () => {
+  connect(); // no-op while the master switch is off
 
   // Auto-select the active tab on startup so we never monitor all tabs
   try {
@@ -1605,15 +1671,17 @@ loadCapabilities().then(async () => {
     // Will remain null until a tab is selected via popup
   }
 
-  // Register webRequest listeners and XHR hook based on persisted capabilities
+  // Register webRequest listeners and XHR hook (also a no-op while off)
   updateListenerRegistrations();
 
   // Eagerly inject console capture into the monitored tab on startup
-  if (capabilities.console && monitoredTabId !== null) {
+  if (extensionEnabled && capabilities.console && monitoredTabId !== null) {
     try {
       await injectConsoleCapture(monitoredTabId);
     } catch {
       // May fail on privileged pages — ignore
     }
   }
+
+  refreshBadge();
 });

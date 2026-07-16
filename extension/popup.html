@@ -58,6 +58,21 @@
       font-family: monospace;
     }
 
+    /* Master on/off switch */
+    .master {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 12px 16px;
+      border-bottom: 1px solid #313244;
+      background: #181825;
+    }
+
+    .master .capability-name {
+      font-size: 13px;
+      font-weight: 600;
+    }
+
     .capabilities {
       padding: 8px 0;
     }
@@ -266,6 +281,17 @@
       <div class="status-dot" id="status-dot"></div>
       <span id="status-text">Disconnected</span>
     </div>
+  </div>
+
+  <div class="master">
+    <div class="capability-info">
+      <span class="capability-name">Extension</span>
+      <span class="capability-desc" id="master-desc">&nbsp;</span>
+    </div>
+    <label class="toggle">
+      <input type="checkbox" id="master-toggle">
+      <span class="toggle-track"></span>
+    </label>
   </div>
 
   <div class="connection-info" id="connection-info"></div>

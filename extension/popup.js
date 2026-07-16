@@ -2,6 +2,8 @@
 
 const statusDot = document.getElementById("status-dot");
 const statusText = document.getElementById("status-text");
+const masterToggle = document.getElementById("master-toggle");
+const masterDesc = document.getElementById("master-desc");
 const toggles = document.querySelectorAll("input[data-capability]");
 const tabSelect = document.getElementById("tab-select");
 const capabilitiesDiv = document.getElementById("capabilities");
@@ -14,19 +16,31 @@ const statConsole = document.getElementById("stat-console");
 const clearBtn = document.getElementById("clear-btn");
 
 function updateUI(response) {
-  if (response.connected !== undefined) {
-    if (response.connected) {
+  if (response.enabled !== undefined || response.connected !== undefined) {
+    const enabled = response.enabled !== false; // default on if unknown
+    const connected = !!response.connected;
+
+    if (response.enabled !== undefined) {
+      masterToggle.checked = enabled;
+      masterDesc.textContent = enabled ? "On" : "Off";
+    }
+
+    // Capability toggles and the tab selector are interactive only when the
+    // extension is on AND connected. The master switch itself is always live.
+    const interactive = enabled && connected;
+    capabilitiesDiv.classList.toggle("disabled", !interactive);
+    tabSelect.disabled = !interactive;
+    for (const toggle of toggles) toggle.disabled = !interactive;
+
+    if (!enabled) {
+      statusDot.classList.remove("connected");
+      statusText.textContent = "Off";
+    } else if (connected) {
       statusDot.classList.add("connected");
       statusText.textContent = "Connected";
-      capabilitiesDiv.classList.remove("disabled");
-      tabSelect.disabled = false;
-      for (const toggle of toggles) toggle.disabled = false;
     } else {
       statusDot.classList.remove("connected");
       statusText.textContent = "Disconnected";
-      capabilitiesDiv.classList.add("disabled");
-      tabSelect.disabled = true;
-      for (const toggle of toggles) toggle.disabled = true;
     }
   }
 
@@ -126,6 +140,19 @@ loadTabs();
 // Refresh stats periodically while popup is open
 const statsInterval = setInterval(refreshStatus, 2000);
 window.addEventListener("unload", () => clearInterval(statsInterval));
+
+// Master on/off switch
+masterToggle.addEventListener("change", () => {
+  const enabled = masterToggle.checked;
+  masterDesc.textContent = enabled ? "On" : "Off";
+  browser.runtime.sendMessage({ type: "set_enabled", enabled }).then(() => {
+    refreshStatus(); // reflect the torn-down / reconnecting state immediately
+  }).catch((err) => {
+    console.error("[BrowserBridge Popup] Failed to set enabled:", err);
+    masterToggle.checked = !enabled; // revert on failure
+    masterDesc.textContent = masterToggle.checked ? "On" : "Off";
+  });
+});
 
 // Handle tab selector changes
 tabSelect.addEventListener("change", () => {

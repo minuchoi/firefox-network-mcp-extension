@@ -16,7 +16,7 @@ uv sync
 uv run python -m mcp_server.server
 ```
 
-The Firefox extension is loaded as a temporary add-on via `about:debugging#/runtime/this-firefox` → Load `extension/manifest.json`. The extension badge shows "ON" (green) when connected to the MCP server.
+The Firefox extension is loaded as a temporary add-on via `about:debugging#/runtime/this-firefox` → Load `extension/manifest.json`. The badge shows "ON" (green) when connected, "OFF" (red) when enabled but not connected, and "OFF" (grey) when switched off via the popup's master toggle.
 
 The MCP server is configured in `.mcp.json` to launch via `uv run`.
 
@@ -30,7 +30,7 @@ The MCP server is configured in `.mcp.json` to launch via `uv run`.
    - Captures response bodies via `filterResponseData` (primary) and page-level XHR/fetch hooking (fallback for POST responses where `filterResponseData` fails)
    - Injects content scripts on-demand for DOM queries, console log capture, and WebSocket frame interception. Console capture and WebSocket interception both run in the **page world** via `<script>` tag injection (not the content-script sandbox): a content-script `console` override or `window.WebSocket` assignment does not affect the page's own calls under Firefox Xray isolation. Console logs are stored on the page's `window.__browserBridgeConsoleLogs` and read back through `window.wrappedJSObject`.
    - Sends captured data and tool responses as JSON messages to the server
-   - Popup UI (`popup.html` / `popup.js`) with toggles for network, DOM, console, WebSocket, and interact capabilities
+   - Popup UI (`popup.html` / `popup.js`) with a master on/off switch plus per-capability toggles for network, DOM, console, WebSocket, and interact. The master switch (`extensionEnabled`, persisted as `enabled` in `browser.storage.local`) fully deactivates the extension when off: it closes the WebSocket, suppresses reconnection, and tears down all webRequest listeners and content-script hooks via `updateListenerRegistrations()` (which early-returns to unregister-all when off). Per-capability toggles are only interactive when the extension is on and connected.
    - Capability state persisted via `browser.storage.local`
 
 2. **Python MCP Server** (`src/mcp_server/`) — Async server running two concurrent tasks:

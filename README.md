@@ -98,7 +98,7 @@ uv sync
 1. Open Firefox and navigate to `about:debugging#/runtime/this-firefox`
 2. Click **Load Temporary Add-on...**
 3. Select `extension/manifest.json` from the cloned repository
-4. The extension badge shows **ON** (green) when connected to the MCP server, **OFF** (red) when disconnected
+4. The extension badge shows **ON** (green) when connected to the MCP server, **OFF** (red) when enabled but not connected, and **OFF** (grey) when switched off with the popup's master toggle
 
 ### 4. Configure MCP in your project
 
@@ -126,7 +126,8 @@ The MCP tools appear automatically. You can verify by asking Claude to list its 
 Click the extension icon in the Firefox toolbar to open the control panel. From here you can:
 
 - See the **connection status** (green dot = connected to MCP server, red = disconnected)
-- Toggle individual capabilities on or off:
+- Flip the **master on/off switch** (labelled *Extension*) to fully activate or deactivate the extension. When off, it disconnects from the server and removes all traffic listeners and page hooks, so it has zero effect on browsing until switched back on. The setting persists across restarts.
+- Toggle individual capabilities on or off (only available while the extension is on and connected):
 
 | Toggle | Controls | MCP Tools Affected |
 |--------|----------|--------------------|
